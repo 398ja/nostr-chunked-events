@@ -1,0 +1,105 @@
+/**
+ * nostr-chunked-events
+ *
+ * A library for chunking and reassembling large Nostr events
+ * to overcome relay message size limits.
+ *
+ * @packageDocumentation
+ */
+
+// ============================================================================
+// High-Level API (Recommended)
+// ============================================================================
+
+export { ChunkedPublisher, createMigrationMarker } from './publisher';
+export { ChunkedFetcher } from './fetcher';
+
+// ============================================================================
+// Low-Level API (Pure Functions)
+// ============================================================================
+
+// Chunking
+export {
+  createChunks,
+  needsChunking,
+  calculateSize,
+  estimateChunkCount,
+  getSingleEventDTag,
+  getChunkDTag,
+  parseDTag,
+} from './chunker';
+
+// Reassembly
+export {
+  reassembleChunks,
+  validateChunks,
+  sortChunks,
+  parseChunkFromEvent,
+  isChunkEvent,
+  hasMigrationMarker,
+  getTotalChunks,
+  getEventVersion,
+  getCompressionType,
+} from './reassembler';
+
+// Compression
+export {
+  compress,
+  decompress,
+  isCompressed,
+  tryDecompress,
+} from './compression';
+
+// Relay utilities
+export { RelayPool, publishToRelay, queryRelay } from './relay';
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+export {
+  configure,
+  config,
+  MAX_SINGLE_EVENT_SIZE,
+  DEFAULT_CHUNK_SIZE,
+  DEFAULT_RELAY_TIMEOUT,
+  DEFAULT_RELAY_RETRIES,
+  LIBRARY_VERSION,
+  CLIENT_TAG,
+  TAGS,
+  COMPRESSION,
+  D_TAG_SUFFIXES,
+} from './constants';
+
+// ============================================================================
+// Types
+// ============================================================================
+
+export type {
+  // Core types
+  Chunk,
+  ChunkData,
+  ChunkOptions,
+  ValidationResult,
+
+  // Compression
+  CompressionResult,
+
+  // Signer
+  Signer,
+
+  // Publisher
+  PublisherOptions,
+  PublishOptions,
+  PublishResult,
+
+  // Fetcher
+  FetcherOptions,
+  FetchOptions,
+  FetchResult,
+  ProbeResult,
+
+  // Relay
+  RelayOptions,
+  RelayPublishResponse,
+} from './types';
