@@ -4,9 +4,27 @@
  */
 
 import { Relay, SimplePool } from 'nostr-tools';
-import type { Event, Filter } from 'nostr-tools';
+import type { Event, EventTemplate, Filter, VerifiedEvent } from 'nostr-tools';
 import { config } from './constants';
 import type { RelayOptions, RelayPublishResponse } from './types';
+
+/**
+ * Race a promise against a timer, always clearing the timer so it does not
+ * keep the process alive.
+ */
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === 'string') return error;
+  return 'Unknown error';
+}
 
 /**
  * Managed relay pool for publishing and querying events
@@ -27,50 +45,47 @@ export class RelayPool {
   }
 
   /**
-   * Publish an event to all relays
+   * Publish an event to all relays.
+   *
+   * A relay counts as successful only when it answers `OK true`. An `OK false`
+   * (e.g. strfry's "event too large"), a timeout or a connection error is a
+   * failure, with the relay's reason in `message`.
    *
    * @param event - Signed event to publish
    * @returns Array of responses from each relay
    */
   async publish(event: Event): Promise<RelayPublishResponse[]> {
-    const responses: RelayPublishResponse[] = [];
+    const authHandler = this.options.authHandler;
+    const onauth = authHandler
+      ? async (template: EventTemplate): Promise<VerifiedEvent> => {
+          const challenge = template.tags.find((tag) => tag[0] === 'challenge')?.[1] ?? '';
+          return (await authHandler(challenge)) as VerifiedEvent;
+        }
+      : undefined;
 
-    const publishPromises = this.urls.map(async (url) => {
+    return Promise.all(this.urls.map(async (url): Promise<RelayPublishResponse> => {
       try {
-        await Promise.race([
-          this.pool.publish([url], event),
-          this.timeout(this.options.timeout!),
-        ]);
-
-        responses.push({
-          success: true,
-          relay: url,
-        });
+        // SimplePool.publish returns one promise per relay; it resolves on
+        // OK=true and rejects on OK=false. Await it, do not just call it.
+        const [ack] = this.pool.publish([url], event, onauth ? { onauth } : undefined);
+        const reason = await withTimeout(ack, this.options.timeout!, 'Timeout');
+        return { success: true, relay: url, message: reason };
       } catch (error) {
-        responses.push({
-          success: false,
-          relay: url,
-          message: error instanceof Error ? error.message : 'Unknown error',
-        });
+        return { success: false, relay: url, message: errorMessage(error) };
       }
-    });
-
-    await Promise.allSettled(publishPromises);
-    return responses;
+    }));
   }
 
   /**
    * Query events from relays
    *
    * @param filter - Nostr filter
-   * @returns Array of matching events (deduplicated by event ID)
+   * @returns Array of matching events (deduplicated by event ID). On timeout
+   *   or error, returns what arrived so far (possibly []).
    */
   async query(filter: Filter): Promise<Event[]> {
     try {
-      const events = await Promise.race([
-        this.pool.querySync(this.urls, filter),
-        this.timeout(this.options.timeout!).then(() => [] as Event[]),
-      ]);
+      const events = await this.pool.querySync(this.urls, filter, { maxWait: this.options.timeout });
 
       // Deduplicate by event ID
       const seen = new Set<string>();
@@ -102,15 +117,6 @@ export class RelayPool {
   close(): void {
     this.pool.close(this.urls);
   }
-
-  /**
-   * Create a timeout promise
-   */
-  private timeout(ms: number): Promise<never> {
-    return new Promise((_, reject) => {
-      setTimeout(() => reject(new Error('Timeout')), ms);
-    });
-  }
 }
 
 /**
@@ -136,20 +142,7 @@ export async function publishToRelay(
       const relay = await Relay.connect(url);
 
       try {
-        // Handle NIP-42 auth if callback provided
-        if (options?.authHandler) {
-          // nostr-tools handles AUTH automatically if you provide a callback
-          // But we need to set it up before publishing
-        }
-
-        await Promise.race([
-          relay.publish(event),
-          new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('Publish timeout')), timeout)
-          ),
-        ]);
-
-        relay.close();
+        await withTimeout(relay.publish(event), timeout, 'Publish timeout');
 
         return {
           success: true,
@@ -195,7 +188,7 @@ export async function queryRelay(
     try {
       const events: Event[] = [];
 
-      await Promise.race([
+      await withTimeout(
         new Promise<void>((resolve) => {
           const sub = relay.subscribe([filter], {
             onevent(event: Event) {
@@ -207,10 +200,9 @@ export async function queryRelay(
             },
           });
         }),
-        new Promise<void>((_, reject) =>
-          setTimeout(() => reject(new Error('Query timeout')), timeout)
-        ),
-      ]);
+        timeout,
+        'Query timeout',
+      );
 
       return events;
     } finally {
