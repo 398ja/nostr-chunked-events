@@ -3,18 +3,36 @@
  * Handles automatic chunking and publishing of large content
  */
 
-import type { Event, UnsignedEvent } from 'nostr-tools';
-import { createChunks, needsChunking, calculateSize, getChunkDTag, getSingleEventDTag } from './chunker';
+import type { UnsignedEvent } from 'nostr-tools';
+import { createChunks, createSnapshotChunks, needsChunking, calculateSize, getSingleEventDTag } from './chunker';
 import { compress } from './compression';
 import { RelayPool } from './relay';
-import { TAGS, LIBRARY_VERSION, CLIENT_TAG, COMPRESSION } from './constants';
+import { TAGS, LIBRARY_VERSION, CLIENT_TAG, COMPRESSION, config } from './constants';
 import type {
   Signer,
   PublisherOptions,
   PublishOptions,
   PublishResult,
-  Chunk,
+  ChunkPublishResult,
+  RelayPublishResponse,
 } from './types';
+
+function toChunkResult(index: number, eventId: string, responses: RelayPublishResponse[]): ChunkPublishResult {
+  return {
+    index,
+    eventId,
+    acceptedBy: responses.filter((r) => r.success).map((r) => r.relay),
+    rejectedBy: responses.filter((r) => !r.success).map((r) => ({ relay: r.relay, message: r.message })),
+  };
+}
+
+function firstRejection(results: ChunkPublishResult[]): string | undefined {
+  for (const result of results) {
+    const rejection = result.rejectedBy.find((r) => r.message);
+    if (rejection) return `${rejection.relay}: ${rejection.message}`;
+  }
+  return undefined;
+}
 
 /**
  * Publisher for chunked events
@@ -101,8 +119,8 @@ export class ChunkedPublisher {
 
       const finalSize = calculateSize(processedContent);
 
-      // Check if chunking is needed
-      if (!needsChunking(processedContent)) {
+      // Check if chunking is needed (per-call threshold, then global default)
+      if (!needsChunking(processedContent, options.maxSingleEventSize ?? config.maxSingleEventSize)) {
         // Single event
         return await this.publishSingleEvent(
           processedContent,
@@ -159,9 +177,9 @@ export class ChunkedPublisher {
    * Delete all chunks for a given prefix
    */
   async deleteChunks(
-    kind: number,
-    dTagPrefix: string,
-    relayUrls?: string[]
+    _kind: number,
+    _dTagPrefix: string,
+    _relayUrls?: string[]
   ): Promise<{ success: boolean; deleted: number }> {
     // TODO: Implement NIP-09 deletion events
     return { success: false, deleted: 0 };
@@ -200,6 +218,7 @@ export class ChunkedPublisher {
     try {
       const responses = await pool.publish(signedEvent);
       const successCount = responses.filter((r) => r.success).length;
+      const chunkResults = [toChunkResult(0, signedEvent.id, responses)];
 
       options.onProgress?.(1, 1);
 
@@ -212,7 +231,10 @@ export class ChunkedPublisher {
         publishedAt: signedEvent.created_at * 1000,
         originalSize,
         finalSize,
-        error: successCount === 0 ? 'All relays failed' : undefined,
+        chunkResults,
+        error: successCount === 0
+          ? `All relays failed${firstRejection(chunkResults) ? ` (${firstRejection(chunkResults)})` : ''}`
+          : undefined,
       };
     } finally {
       pool.close();
@@ -231,9 +253,22 @@ export class ChunkedPublisher {
     originalSize: number,
     finalSize: number
   ): Promise<PublishResult> {
-    // Create chunks
-    const chunks = createChunks(content, { dTagPrefix: options.dTagPrefix });
+    // Create chunks (per-call chunk size, then global default)
+    const chunkSize = options.chunkSize ?? config.chunkSize;
+    const snapshotOptions = options.snapshot === true ? {} : options.snapshot || null;
+    const snapshot = snapshotOptions
+      ? createSnapshotChunks(content, {
+          chunkSize,
+          dTagPrefix: options.dTagPrefix,
+          snapshotId: snapshotOptions.snapshotId,
+          parents: snapshotOptions.parents,
+        })
+      : null;
+    const chunks = snapshot
+      ? snapshot.chunks.map((chunk) => ({ ...chunk, dTag: chunk.dTag as string }))
+      : createChunks(content, { chunkSize, dTagPrefix: options.dTagPrefix });
     const eventIds: string[] = [];
+    const chunkResults: ChunkPublishResult[] = [];
     let successCount = 0;
 
     const pool = new RelayPool(relayUrls, {
@@ -249,7 +284,8 @@ export class ChunkedPublisher {
           chunk.index,
           chunk.total,
           isCompressed,
-          options.additionalTags
+          options.additionalTags,
+          snapshot ? snapshot.chunks[i].tags : undefined,
         );
 
         const unsignedEvent: UnsignedEvent = {
@@ -264,6 +300,7 @@ export class ChunkedPublisher {
         eventIds.push(signedEvent.id);
 
         const responses = await pool.publish(signedEvent);
+        chunkResults.push(toChunkResult(chunk.index, signedEvent.id, responses));
         if (responses.some((r) => r.success)) {
           successCount++;
         }
@@ -271,6 +308,7 @@ export class ChunkedPublisher {
         options.onProgress?.(i + 1, chunks.length);
       }
 
+      const rejection = firstRejection(chunkResults);
       return {
         success: successCount === chunks.length,
         chunked: true,
@@ -280,7 +318,11 @@ export class ChunkedPublisher {
         publishedAt: Date.now(),
         originalSize,
         finalSize,
-        error: successCount < chunks.length ? `Only ${successCount}/${chunks.length} chunks published` : undefined,
+        snapshotId: snapshot?.snapshotId,
+        chunkResults,
+        error: successCount < chunks.length
+          ? `Only ${successCount}/${chunks.length} chunks published${rejection ? ` (${rejection})` : ''}`
+          : undefined,
       };
     } finally {
       pool.close();
@@ -295,7 +337,8 @@ export class ChunkedPublisher {
     chunkIndex: number | null,
     chunkTotal: number | null,
     isCompressed: boolean,
-    additionalTags?: string[][]
+    additionalTags?: string[][],
+    snapshotTags?: string[][],
   ): string[][] {
     const tags: string[][] = [
       [TAGS.D_TAG, dTag],
@@ -303,8 +346,10 @@ export class ChunkedPublisher {
       [TAGS.CLIENT, CLIENT_TAG],
     ];
 
-    // Add chunk tag if this is a chunk
-    if (chunkIndex !== null && chunkTotal !== null) {
+    if (snapshotTags) {
+      // chunk, snapshot_id, payload_hash, hash_alg, total_chunks, parents (d is already set)
+      tags.push(...snapshotTags.filter((tag) => tag[0] !== TAGS.D_TAG));
+    } else if (chunkIndex !== null && chunkTotal !== null) {
       tags.push([TAGS.CHUNK, chunkIndex.toString(), chunkTotal.toString()]);
     }
 

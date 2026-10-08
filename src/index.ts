@@ -13,6 +13,7 @@
 
 export { ChunkedPublisher, createMigrationMarker } from './publisher';
 export { ChunkedFetcher } from './fetcher';
+export { ancestryOf, supersedesRelation, MAX_WALK } from './ancestry';
 
 // ============================================================================
 // Low-Level API (Pure Functions)
@@ -21,6 +22,7 @@ export { ChunkedFetcher } from './fetcher';
 // Chunking
 export {
   createChunks,
+  createSnapshotChunks,
   needsChunking,
   calculateSize,
   estimateChunkCount,
@@ -35,6 +37,16 @@ export {
   validateChunks,
   sortChunks,
   parseChunkFromEvent,
+  parseChunkEvent,
+  filterEventsByAuthor,
+  groupChunksBySnapshot,
+  validateSnapshot,
+  selectBestSnapshot,
+  reassembleSnapshot,
+  describeChunkValidationFailure,
+  isGenesis,
+  isMergeSnapshot,
+  isLegacyPreAncestry,
   isChunkEvent,
   hasMigrationMarker,
   getTotalChunks,
@@ -50,6 +62,14 @@ export {
   tryDecompress,
 } from './compression';
 
+// Hashing and size budgeting
+export {
+  sha256Hex,
+  nip44CiphertextSize,
+  maxNip44PlaintextSize,
+  NIP44_MAX_PLAINTEXT_SIZE,
+} from './hash';
+
 // Relay utilities
 export { RelayPool, publishToRelay, queryRelay } from './relay';
 
@@ -62,6 +82,9 @@ export {
   config,
   MAX_SINGLE_EVENT_SIZE,
   DEFAULT_CHUNK_SIZE,
+  DEFAULT_MAX_CHUNKS,
+  STRFRY_DEFAULT_MAX_EVENT_SIZE,
+  HASH_ALG_SHA256,
   DEFAULT_RELAY_TIMEOUT,
   DEFAULT_RELAY_RETRIES,
   LIBRARY_VERSION,
@@ -79,8 +102,22 @@ export type {
   // Core types
   Chunk,
   ChunkData,
+  ChunkMetadata,
+  ChunkEventData,
+  SnapshotParentReference,
   ChunkOptions,
+  ChunkValidationOptions,
   ValidationResult,
+  SnapshotChunkOptions,
+  SnapshotChunk,
+  SnapshotChunks,
+  SnapshotValidationIssue,
+  SnapshotValidationOptions,
+  SnapshotValidationResult,
+  SnapshotCandidate,
+  SnapshotSelectionOptions,
+  SnapshotSelectionResult,
+  AncestrySnapshotLike,
 
   // Compression
   CompressionResult,
@@ -92,12 +129,15 @@ export type {
   PublisherOptions,
   PublishOptions,
   PublishResult,
+  PublishSnapshotOptions,
+  ChunkPublishResult,
 
   // Fetcher
   FetcherOptions,
   FetchOptions,
   FetchResult,
   ProbeResult,
+  QueryEventsFn,
 
   // Relay
   RelayOptions,
