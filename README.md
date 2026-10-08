@@ -22,6 +22,15 @@ Everything runs in browsers and Node: the code uses `TextEncoder`/`Uint8Array` a
 npm install nostr-chunked-events nostr-tools
 ```
 
+### Compatibility
+
+ESM consumers work with any `nostr-tools` 2.x on supported Node versions.
+
+CommonJS consumers (`require('nostr-chunked-events')`) on Node < 20.19 need
+`nostr-tools` < 2.25, or Node >= 20.19. From 2.25, nostr-tools' own CJS build
+`require()`s the ESM-only `@noble/curves`, which older Node cannot load. This
+is an upstream limitation, not one of this package.
+
 ## Size limits and defaults
 
 The defaults are safe for strfry, the most common relay:
