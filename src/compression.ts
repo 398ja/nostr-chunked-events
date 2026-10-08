@@ -3,6 +3,7 @@
  */
 
 import pako from 'pako';
+import { config } from './constants';
 import type { CompressionResult } from './types';
 
 /**
@@ -39,23 +40,68 @@ export function compress(content: string): CompressionResult {
   };
 }
 
+/** Options for {@link decompress} */
+export interface DecompressOptions {
+  /**
+   * Largest decompressed output accepted, in bytes (default:
+   * config.maxDecompressedSize = 8 MiB). Inflation stops as soon as the output
+   * passes it, so a gzip bomb never allocates more than about this much.
+   */
+  maxSize?: number;
+}
+
+/** Output block size for streaming inflation */
+const INFLATE_CHUNK_SIZE = 64 * 1024;
+
 /**
  * Decompress gzip-compressed content
  *
+ * Inflates in streaming mode and aborts once the output exceeds `maxSize`, so
+ * a small payload that expands to gigabytes (a gzip bomb) is refused.
+ *
  * @param compressedBase64 - Base64-encoded gzip data
+ * @param options - Size limit
  * @returns Original decompressed string
- * @throws Error if decompression fails
+ * @throws Error if decompression fails or the output exceeds `maxSize`
  */
-export function decompress(compressedBase64: string): string {
-  // Decode base64 to Uint8Array
+export function decompress(compressedBase64: string, options: DecompressOptions = {}): string {
+  const maxSize = options.maxSize ?? config.maxDecompressedSize;
   const compressed = base64ToUint8Array(compressedBase64);
 
-  // Decompress
-  const decompressed = pako.ungzip(compressed);
+  const blocks: Uint8Array[] = [];
+  let total = 0;
+  const inflator = new pako.Inflate({ chunkSize: INFLATE_CHUNK_SIZE });
+  inflator.onData = (block: Uint8Array) => {
+    total += block.length;
+    if (total > maxSize) {
+      throw new DecompressedSizeError(maxSize);
+    }
+    blocks.push(block);
+  };
+  inflator.push(compressed, true);
+  if (inflator.err) {
+    throw new Error(inflator.msg || `inflate error ${inflator.err}`);
+  }
+  // `ended` exists at runtime (pako 2) but is missing from @types/pako.
+  if (!(inflator as unknown as { ended: boolean }).ended) {
+    throw new Error('Truncated gzip data');
+  }
 
-  // Convert back to string
-  const decoder = new TextDecoder();
-  return decoder.decode(decompressed);
+  const output = new Uint8Array(total);
+  let offset = 0;
+  for (const block of blocks) {
+    output.set(block, offset);
+    offset += block.length;
+  }
+  return new TextDecoder().decode(output);
+}
+
+/** Thrown by {@link decompress} when the output would exceed the size limit */
+export class DecompressedSizeError extends Error {
+  constructor(public readonly maxSize: number) {
+    super(`Decompressed size exceeds ${maxSize} bytes (maxDecompressedSize)`);
+    this.name = 'DecompressedSizeError';
+  }
 }
 
 /**
@@ -91,7 +137,9 @@ export function tryDecompress(content: string, isMarkedCompressed: boolean): str
 
   try {
     return decompress(content);
-  } catch {
+  } catch (error) {
+    // Never fall back to the raw content for a bomb; that is not an edge case.
+    if (error instanceof DecompressedSizeError) throw error;
     // If decompression fails, return original content
     // This handles edge cases where tag says compressed but content isn't
     return content;
@@ -99,34 +147,23 @@ export function tryDecompress(content: string, isMarkedCompressed: boolean): str
 }
 
 /**
- * Convert Uint8Array to base64 string
- * Works in both Node.js and browser environments
+ * Convert Uint8Array to base64 string using only browser/standard APIs
+ * (btoa exists in browsers and Node >= 16).
  */
 function uint8ArrayToBase64(bytes: Uint8Array): string {
-  // Node.js
-  if (typeof Buffer !== 'undefined') {
-    return Buffer.from(bytes).toString('base64');
-  }
-
-  // Browser
   let binary = '';
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i]);
+  const step = 0x8000;
+  for (let i = 0; i < bytes.length; i += step) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + step));
   }
   return btoa(binary);
 }
 
 /**
- * Convert base64 string to Uint8Array
- * Works in both Node.js and browser environments
+ * Convert base64 string to Uint8Array using only browser/standard APIs
+ * (atob exists in browsers and Node >= 16).
  */
 function base64ToUint8Array(base64: string): Uint8Array {
-  // Node.js
-  if (typeof Buffer !== 'undefined') {
-    return new Uint8Array(Buffer.from(base64, 'base64'));
-  }
-
-  // Browser
   const binary = atob(base64);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) {

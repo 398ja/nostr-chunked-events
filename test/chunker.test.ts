@@ -8,7 +8,6 @@ import {
   getChunkDTag,
   parseDTag,
 } from '../src/chunker';
-import { configure } from '../src/constants';
 
 describe('chunker', () => {
   describe('needsChunking', () => {

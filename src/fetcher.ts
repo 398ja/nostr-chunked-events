@@ -1,22 +1,143 @@
 /**
  * Chunked event fetcher
  * Handles automatic detection, fetching, and reassembly of chunked content
+ *
+ * Every query result is filtered to the exact requested author before use,
+ * whatever the source (relays or a custom `queryEvents` function).
  */
 
+import { verifyEvent } from 'nostr-tools';
 import type { Event, Filter } from 'nostr-tools';
 import {
+  describeChunkValidationFailure,
+  filterEventsByAuthor,
+  getCompressionType,
+  hasMigrationMarker,
+  parseChunkEvent,
   parseChunkFromEvent,
   reassembleChunks,
+  reassembleSnapshot,
+  selectBestSnapshot,
   validateChunks,
-  hasMigrationMarker,
-  getCompressionType,
-  sortChunks,
+  validateSnapshot,
 } from './reassembler';
 import { getChunkDTag, getSingleEventDTag } from './chunker';
-import { tryDecompress } from './compression';
-import { RelayPool } from './relay';
-import { TAGS } from './constants';
-import type { FetcherOptions, FetchOptions, FetchResult, ProbeResult, ChunkData } from './types';
+import { decompress } from './compression';
+import { RelayPool, RelaysUnreachableError } from './relay';
+import { config } from './constants';
+import type {
+  ChunkData,
+  ChunkEventData,
+  FetcherOptions,
+  FetchOptions,
+  FetchResult,
+  ProbeResult,
+  QueryEventsFn,
+} from './types';
+
+/** How many competing chunk-0 events strict mode looks at */
+const STRICT_CHUNK0_LIMIT = 10;
+
+/** d-tags per query when fetching many chunks, to stay under relay filter limits */
+const D_TAG_BATCH_SIZE = 100;
+
+/** A `queryEvents` source threw: the data may exist, we just could not ask. */
+export class SourceUnreachableError extends Error {
+  constructor(cause: unknown) {
+    super(`Query source unreachable: ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = 'SourceUnreachableError';
+  }
+}
+
+/**
+ * A `queryEvents` source returned events, but every one failed id/signature
+ * verification, so nothing usable is left. The data may exist: the source may
+ * strip or re-serialize signatures. Never treat this as an empty account.
+ */
+export class SignatureVerificationError extends Error {
+  constructor(public readonly droppedCount: number) {
+    super(
+      `All ${droppedCount} event(s) from queryEvents failed signature verification and were dropped ` +
+      '(set verifySignatures: false only if the source already verifies)',
+    );
+    this.name = 'SignatureVerificationError';
+  }
+}
+
+function isUnreachable(error: unknown): error is Error {
+  return error instanceof SourceUnreachableError || error instanceof RelaysUnreachableError;
+}
+
+interface QuerySource {
+  query: QueryEventsFn;
+  close: () => void;
+  /**
+   * Called only once nothing usable was found: throw SignatureVerificationError
+   * if the author's events did arrive but all failed verification.
+   */
+  assertNotAllDropped: () => void;
+}
+
+function failure(partial: Partial<FetchResult> & { error: string }): FetchResult {
+  return {
+    success: false,
+    content: null,
+    chunked: false,
+    chunkCount: 0,
+    events: [],
+    compressed: false,
+    ...partial,
+  };
+}
+
+/**
+ * Decode content according to its `compressed` tag. Unlike `tryDecompress`,
+ * a payload that claims to be compressed but does not decompress is an error,
+ * not silently returned as-is.
+ */
+function decodeContent(
+  content: string,
+  event: Event,
+  maxSize: number,
+): { content: string; compressed: boolean } {
+  const compressed = getCompressionType(event) !== null;
+  if (!compressed) {
+    return { content, compressed };
+  }
+  try {
+    return { content: decompress(content, { maxSize }), compressed };
+  } catch (error) {
+    throw new Error(`Content is tagged compressed but failed to decompress: ${
+      error instanceof Error ? error.message : String(error)
+    }`);
+  }
+}
+
+/** Newest first, so a stale relay's copy never beats a fresh one. */
+function newestFirst(events: Event[]): Event[] {
+  return [...events].sort((a, b) => b.created_at - a.created_at);
+}
+
+/**
+ * Check id and signature on a copy holding only the event fields. nostr-tools
+ * caches a verification result on the event object under a symbol, which an
+ * object spread would carry over to a tampered copy.
+ */
+function hasValidSignature(event: Event): boolean {
+  try {
+    return verifyEvent({
+      id: event.id,
+      pubkey: event.pubkey,
+      created_at: event.created_at,
+      kind: event.kind,
+      tags: event.tags,
+      content: event.content,
+      sig: event.sig,
+    });
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Fetcher for chunked events
@@ -51,7 +172,60 @@ export class ChunkedFetcher {
       defaultRelays: options?.defaultRelays ?? [],
       authHandler: options?.authHandler,
       timeout: options?.timeout,
+      queryEvents: options?.queryEvents,
+      maxChunks: options?.maxChunks,
+      verifySignatures: options?.verifySignatures,
+      maxDecompressedSize: options?.maxDecompressedSize,
     };
+  }
+
+  private openSource(options: FetchOptions): QuerySource | null {
+    const queryEvents = this.options.queryEvents;
+    if (queryEvents) {
+      const verify = this.options.verifySignatures !== false;
+      let dropped = 0;
+      return {
+        query: async (filter) => {
+          let events: Event[];
+          try {
+            events = await queryEvents(filter);
+          } catch (error) {
+            throw new SourceUnreachableError(error);
+          }
+          if (!verify) return events;
+          const valid = events.filter(hasValidSignature);
+          // Only events claiming a requested author count: a foreign event
+          // would have been discarded by the author filter anyway.
+          dropped += events.filter((event) => !valid.includes(event)
+            && (!filter.authors || filter.authors.includes(event.pubkey))).length;
+          return valid;
+        },
+        close: () => {},
+        assertNotAllDropped: () => {
+          if (dropped > 0) throw new SignatureVerificationError(dropped);
+        },
+      };
+    }
+
+    const relayUrls = options.relayUrls ?? this.options.defaultRelays ?? [];
+    if (relayUrls.length === 0) {
+      return null;
+    }
+
+    const pool = new RelayPool(relayUrls, {
+      timeout: options.timeout ?? this.options.timeout,
+      authHandler: this.options.authHandler,
+    });
+    // nostr-tools' SimplePool verifies and drops bad events itself.
+    return { query: (filter) => pool.query(filter), close: () => pool.close(), assertNotAllDropped: () => {} };
+  }
+
+  private maxDecompressedSize(options: FetchOptions): number {
+    return options.maxDecompressedSize ?? this.options.maxDecompressedSize ?? config.maxDecompressedSize;
+  }
+
+  private maxChunks(options: FetchOptions): number {
+    return options.maxChunks ?? options.snapshotSelection?.maxChunks ?? this.options.maxChunks ?? config.maxChunks;
   }
 
   /**
@@ -64,107 +238,70 @@ export class ChunkedFetcher {
    * @returns Fetch result with reassembled content
    */
   async fetch(pubkey: string, options: FetchOptions): Promise<FetchResult> {
-    const relayUrls = options.relayUrls ?? this.options.defaultRelays ?? [];
-
-    if (relayUrls.length === 0) {
-      return {
-        success: false,
-        content: null,
-        chunked: false,
-        chunkCount: 0,
-        events: [],
-        compressed: false,
-        error: 'No relay URLs provided',
-      };
+    const source = this.openSource(options);
+    if (!source) {
+      return failure({ error: 'No relay URLs provided' });
     }
-
-    const pool = new RelayPool(relayUrls, {
-      timeout: options.timeout ?? this.options.timeout,
-      authHandler: this.options.authHandler,
-    });
 
     try {
       const author = options.author ?? pubkey;
+      const useStrictSelection = Boolean(options.snapshotSelection);
 
       // Strategy: Try chunked format first (query for chunk-0)
-      const chunk0DTag = getChunkDTag(options.dTagPrefix, 0);
       const chunk0Filter: Filter = {
         kinds: [options.kind],
         authors: [author],
-        '#d': [chunk0DTag],
-        limit: 1,
+        '#d': [getChunkDTag(options.dTagPrefix, 0)],
+        limit: useStrictSelection ? STRICT_CHUNK0_LIMIT : 1,
       };
 
-      const chunk0Events = await pool.query(chunk0Filter);
+      const chunk0Events = newestFirst(filterEventsByAuthor(await source.query(chunk0Filter), author));
 
       if (chunk0Events.length > 0) {
-        // Found chunked data - fetch all chunks
-        return await this.fetchChunkedData(pool, author, options, chunk0Events[0]);
+        return useStrictSelection
+          ? await this.fetchStrict(source, author, options, chunk0Events)
+          : await this.fetchChunkedData(source, author, options, chunk0Events[0]);
       }
 
       // No chunked data found - try single event format
-      const stateDTag = getSingleEventDTag(options.dTagPrefix);
-      const stateFilter: Filter = {
+      const stateEvents = newestFirst(filterEventsByAuthor(await source.query({
         kinds: [options.kind],
         authors: [author],
-        '#d': [stateDTag],
+        '#d': [getSingleEventDTag(options.dTagPrefix)],
         limit: 1,
-      };
-
-      const stateEvents = await pool.query(stateFilter);
+      }), author));
 
       if (stateEvents.length === 0) {
-        return {
-          success: false,
-          content: null,
-          chunked: false,
-          chunkCount: 0,
-          events: [],
-          compressed: false,
-          error: 'No data found',
-        };
+        source.assertNotAllDropped();
+        return failure({ error: 'No data found' });
       }
 
       const stateEvent = stateEvents[0];
 
-      // Check for migration marker
       if (hasMigrationMarker(stateEvent)) {
-        return {
-          success: false,
-          content: null,
-          chunked: false,
-          chunkCount: 0,
-          events: [stateEvent],
-          compressed: false,
-          error: 'Data migrated to chunks but chunks not found',
-        };
+        return failure({ events: [stateEvent], error: 'Data migrated to chunks but chunks not found' });
       }
 
-      // Single event - check for compression and return
-      const compressionType = getCompressionType(stateEvent);
-      const isCompressed = compressionType !== null;
-      const content = tryDecompress(stateEvent.content, isCompressed);
-
+      const decoded = decodeContent(stateEvent.content, stateEvent, this.maxDecompressedSize(options));
       return {
         success: true,
-        content,
+        content: decoded.content,
         chunked: false,
         chunkCount: 1,
         events: [stateEvent],
-        compressed: isCompressed,
+        compressed: decoded.compressed,
+        snapshotId: null,
       };
     } catch (error) {
-      return {
-        success: false,
-        content: null,
-        chunked: false,
-        chunkCount: 0,
-        events: [],
-        compressed: false,
-        error: error instanceof Error ? error.message : 'Unknown error',
-      };
+      if (isUnreachable(error)) {
+        return failure({ unreachable: true, error: error.message });
+      }
+      if (error instanceof SignatureVerificationError) {
+        return failure({ unverified: true, error: error.message });
+      }
+      return failure({ error: error instanceof Error ? error.message : 'Unknown error' });
     } finally {
-      pool.close();
+      source.close();
     }
   }
 
@@ -188,7 +325,7 @@ export class ChunkedFetcher {
     try {
       const data = JSON.parse(result.content) as T;
       return { ...result, data };
-    } catch (error) {
+    } catch {
       return {
         ...result,
         success: false,
@@ -201,35 +338,29 @@ export class ChunkedFetcher {
   /**
    * Probe for existence of chunked data without fetching all content
    *
+   * Rejects (rather than answering `exists: false`) when the source cannot be
+   * reached (`RelaysUnreachableError`, `SourceUnreachableError`) or when every
+   * event it returned failed signature verification (`SignatureVerificationError`).
+   *
    * @param pubkey - Author's public key in hex
    * @param options - Fetch options
    * @returns Probe result with existence and chunk info
    */
   async probe(pubkey: string, options: FetchOptions): Promise<ProbeResult> {
-    const relayUrls = options.relayUrls ?? this.options.defaultRelays ?? [];
-
-    if (relayUrls.length === 0) {
+    const source = this.openSource(options);
+    if (!source) {
       return { exists: false, chunked: false, chunkCount: 0 };
     }
-
-    const pool = new RelayPool(relayUrls, {
-      timeout: options.timeout ?? this.options.timeout,
-      authHandler: this.options.authHandler,
-    });
 
     try {
       const author = options.author ?? pubkey;
 
-      // Check for chunk-0
-      const chunk0DTag = getChunkDTag(options.dTagPrefix, 0);
-      const chunk0Filter: Filter = {
+      const chunk0Events = filterEventsByAuthor(await source.query({
         kinds: [options.kind],
         authors: [author],
-        '#d': [chunk0DTag],
+        '#d': [getChunkDTag(options.dTagPrefix, 0)],
         limit: 1,
-      };
-
-      const chunk0Events = await pool.query(chunk0Filter);
+      }), author);
 
       if (chunk0Events.length > 0) {
         const chunkData = parseChunkFromEvent(chunk0Events[0]);
@@ -240,132 +371,227 @@ export class ChunkedFetcher {
         };
       }
 
-      // Check for single event
-      const stateDTag = getSingleEventDTag(options.dTagPrefix);
-      const stateFilter: Filter = {
+      const stateEvents = filterEventsByAuthor(await source.query({
         kinds: [options.kind],
         authors: [author],
-        '#d': [stateDTag],
+        '#d': [getSingleEventDTag(options.dTagPrefix)],
         limit: 1,
-      };
-
-      const stateEvents = await pool.query(stateFilter);
+      }), author);
 
       if (stateEvents.length > 0) {
-        const stateEvent = stateEvents[0];
-        if (hasMigrationMarker(stateEvent)) {
+        if (hasMigrationMarker(stateEvents[0])) {
           return { exists: false, chunked: false, chunkCount: 0 };
         }
         return { exists: true, chunked: false, chunkCount: 1 };
       }
 
+      source.assertNotAllDropped();
       return { exists: false, chunked: false, chunkCount: 0 };
     } finally {
-      pool.close();
+      source.close();
     }
   }
 
   /**
-   * Fetch all chunks and reassemble
+   * Query every chunk d-tag up to `total`, in batches so a single filter
+   * never lists more d-tags than relays commonly accept.
+   */
+  private async queryChunkRange(
+    source: QuerySource,
+    author: string,
+    options: FetchOptions,
+    total: number,
+  ): Promise<Event[]> {
+    const batches: Promise<Event[]>[] = [];
+    for (let start = 0; start < total; start += D_TAG_BATCH_SIZE) {
+      const dTags = Array.from(
+        { length: Math.min(D_TAG_BATCH_SIZE, total - start) },
+        (_value, offset) => getChunkDTag(options.dTagPrefix, start + offset),
+      );
+      batches.push(source.query({ kinds: [options.kind], authors: [author], '#d': dTags }));
+    }
+    const seen = new Set<string>();
+    return filterEventsByAuthor((await Promise.all(batches)).flat(), author).filter((event) => {
+      if (seen.has(event.id)) return false;
+      seen.add(event.id);
+      return true;
+    });
+  }
+
+  /**
+   * Strict mode: group every candidate snapshot, validate each one and return
+   * the newest valid one (or the newest seen, per `strategy`).
+   */
+  private async fetchStrict(
+    source: QuerySource,
+    author: string,
+    options: FetchOptions,
+    chunk0Events: Event[],
+  ): Promise<FetchResult> {
+    const maxChunks = this.maxChunks(options);
+    const totals = chunk0Events
+      .map((event) => parseChunkEvent(event)?.total ?? 0)
+      .filter((total) => total > 0 && total <= maxChunks);
+
+    if (totals.length === 0) {
+      return failure({
+        chunked: true,
+        events: chunk0Events,
+        error: `No usable chunk-0 event (invalid chunk tag or total above maxChunks ${maxChunks})`,
+      });
+    }
+
+    const allEvents = await this.queryChunkRange(source, author, options, Math.max(...totals));
+    const validationOptions = {
+      expectedAuthor: author,
+      allowLegacy: true,
+      verifyPayloadHash: true,
+      maxChunks,
+      ...options.snapshotSelection,
+    };
+    const selection = await selectBestSnapshot(allEvents, {
+      strategy: 'newest-valid',
+      ...validationOptions,
+    });
+    const rejectedSnapshots = selection.rejected.map(({ candidate, validation }) => ({
+      snapshotId: candidate.snapshotId,
+      issues: validation.issues,
+    }));
+
+    if (!selection.selected || !selection.validation) {
+      const firstRejected = selection.rejected[0]?.validation.issues[0];
+      return failure({
+        chunked: true,
+        events: allEvents,
+        rejectedSnapshots,
+        error: firstRejected?.message || 'No valid chunk snapshot found',
+      });
+    }
+
+    try {
+      const { content: reassembled, validation } = await reassembleSnapshot(
+        selection.selected.chunks,
+        validationOptions,
+      );
+      const firstEvent = selection.selected.chunks[0]?.rawEvent ?? chunk0Events[0];
+      const decoded = decodeContent(reassembled, firstEvent, this.maxDecompressedSize(options));
+
+      return {
+        success: true,
+        content: decoded.content,
+        chunked: true,
+        chunkCount: validation.totalChunks,
+        events: selection.selected.chunks
+          .map((chunk) => chunk.rawEvent)
+          .filter((event): event is Event => Boolean(event)),
+        compressed: decoded.compressed,
+        snapshotId: validation.snapshotId,
+        validation,
+        rejectedSnapshots,
+      };
+    } catch (error) {
+      return failure({
+        chunked: true,
+        chunkCount: selection.validation.totalChunks,
+        events: allEvents,
+        snapshotId: selection.validation.snapshotId,
+        validation: selection.validation,
+        rejectedSnapshots,
+        error: error instanceof Error ? error.message : 'Reassembly failed',
+      });
+    }
+  }
+
+  /**
+   * Default mode: chunk-0 decides the chunk count, fetch the rest, reassemble.
+   * Rejects totals above maxChunks, foreign-author events, and chunk sets whose
+   * snapshot metadata (when present) disagrees or fails its payload hash.
    */
   private async fetchChunkedData(
-    pool: RelayPool,
+    source: QuerySource,
     author: string,
     options: FetchOptions,
     chunk0Event: Event
   ): Promise<FetchResult> {
-    const chunk0Data = parseChunkFromEvent(chunk0Event);
+    const chunk0Data = parseChunkEvent(chunk0Event);
 
     if (!chunk0Data) {
-      return {
-        success: false,
-        content: null,
-        chunked: true,
-        chunkCount: 0,
-        events: [chunk0Event],
-        compressed: false,
-        error: 'Invalid chunk-0 event',
-      };
+      return failure({ chunked: true, events: [chunk0Event], error: 'Invalid chunk-0 event' });
     }
 
+    const maxChunks = this.maxChunks(options);
     const totalChunks = chunk0Data.total;
+    if (totalChunks > maxChunks) {
+      return failure({
+        chunked: true,
+        events: [chunk0Event],
+        error: `chunk-0 declares ${totalChunks} chunks, above maxChunks ${maxChunks}`,
+      });
+    }
+
     const allEvents: Event[] = [chunk0Event];
-    const allChunks: ChunkData[] = [chunk0Data];
+    const allChunks: ChunkEventData[] = [chunk0Data];
 
-    // Fetch remaining chunks in parallel
     if (totalChunks > 1) {
-      const fetchPromises: Promise<Event[]>[] = [];
-
-      for (let i = 1; i < totalChunks; i++) {
-        const chunkDTag = getChunkDTag(options.dTagPrefix, i);
-        const filter: Filter = {
+      const results = await Promise.all(
+        Array.from({ length: totalChunks - 1 }, (_value, offset) => source.query({
           kinds: [options.kind],
           authors: [author],
-          '#d': [chunkDTag],
+          '#d': [getChunkDTag(options.dTagPrefix, offset + 1)],
           limit: 1,
-        };
-        fetchPromises.push(pool.query(filter));
-      }
-
-      const results = await Promise.all(fetchPromises);
+        })),
+      );
 
       for (const events of results) {
-        if (events.length > 0) {
-          const event = events[0];
-          allEvents.push(event);
-
-          const chunkData = parseChunkFromEvent(event);
-          if (chunkData) {
-            allChunks.push(chunkData);
-          }
+        const [event] = newestFirst(filterEventsByAuthor(events, author));
+        if (!event) {
+          continue;
+        }
+        allEvents.push(event);
+        const chunkData = parseChunkEvent(event);
+        if (chunkData) {
+          allChunks.push(chunkData);
         }
       }
     }
 
-    // Validate chunks
-    const validation = validateChunks(allChunks);
-
-    if (!validation.valid) {
-      return {
-        success: false,
-        content: null,
-        chunked: true,
-        chunkCount: allChunks.length,
-        events: allEvents,
-        compressed: false,
-        error: validation.missing.length > 0
-          ? `Missing chunks: ${validation.missing.join(', ')}`
-          : `Duplicate chunks: ${validation.duplicates.join(', ')}`,
-      };
-    }
-
-    // Reassemble
     try {
-      const reassembled = reassembleChunks(allChunks);
+      const chunkValidation = validateChunks(allChunks as ChunkData[], { maxChunks });
+      if (!chunkValidation.valid) {
+        throw new Error(describeChunkValidationFailure(chunkValidation, { maxChunks }));
+      }
 
-      // Check for compression (use chunk-0 as reference)
-      const compressionType = getCompressionType(chunk0Event);
-      const isCompressed = compressionType !== null;
-      const content = tryDecompress(reassembled, isCompressed);
+      // Chunks that carry snapshot metadata must agree on it, and the payload
+      // hash must match. Legacy chunks without metadata pass unchanged.
+      const snapshotValidation = await validateSnapshot(allChunks, {
+        expectedAuthor: author,
+        allowLegacy: true,
+        verifyPayloadHash: options.verifyPayloadHash !== false,
+        maxChunks,
+      });
+      if (!snapshotValidation.valid) {
+        throw new Error(snapshotValidation.issues[0]?.message ?? 'Invalid snapshot');
+      }
+
+      const reassembled = reassembleChunks(allChunks, { maxChunks });
+      const decoded = decodeContent(reassembled, chunk0Event, this.maxDecompressedSize(options));
 
       return {
         success: true,
-        content,
+        content: decoded.content,
         chunked: true,
         chunkCount: totalChunks,
         events: allEvents,
-        compressed: isCompressed,
+        compressed: decoded.compressed,
+        snapshotId: snapshotValidation.snapshotId,
       };
     } catch (error) {
-      return {
-        success: false,
-        content: null,
+      return failure({
         chunked: true,
         chunkCount: allChunks.length,
         events: allEvents,
-        compressed: false,
         error: error instanceof Error ? error.message : 'Reassembly failed',
-      };
+      });
     }
   }
 }

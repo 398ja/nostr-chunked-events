@@ -4,17 +4,42 @@
  */
 
 import type { Event, UnsignedEvent } from 'nostr-tools';
-import { createChunks, needsChunking, calculateSize, getChunkDTag, getSingleEventDTag } from './chunker';
+import {
+  createChunks,
+  createSnapshotChunks,
+  needsChunking,
+  calculateSize,
+  getSingleEventDTag,
+  serializedEventSize,
+} from './chunker';
 import { compress } from './compression';
 import { RelayPool } from './relay';
-import { TAGS, LIBRARY_VERSION, CLIENT_TAG, COMPRESSION } from './constants';
+import { TAGS, LIBRARY_VERSION, CLIENT_TAG, COMPRESSION, config } from './constants';
 import type {
   Signer,
   PublisherOptions,
   PublishOptions,
   PublishResult,
-  Chunk,
+  ChunkPublishResult,
+  RelayPublishResponse,
 } from './types';
+
+function toChunkResult(index: number, eventId: string, responses: RelayPublishResponse[]): ChunkPublishResult {
+  return {
+    index,
+    eventId,
+    acceptedBy: responses.filter((r) => r.success).map((r) => r.relay),
+    rejectedBy: responses.filter((r) => !r.success).map((r) => ({ relay: r.relay, message: r.message })),
+  };
+}
+
+function firstRejection(results: ChunkPublishResult[]): string | undefined {
+  for (const result of results) {
+    const rejection = result.rejectedBy.find((r) => r.message);
+    if (rejection) return `${rejection.relay}: ${rejection.message}`;
+  }
+  return undefined;
+}
 
 /**
  * Publisher for chunked events
@@ -99,10 +124,21 @@ export class ChunkedPublisher {
         }
       }
 
+      // Readers refuse gzip output above maxDecompressedSize (a bomb guard
+      // that must not follow the writer), so never write what they refuse.
+      const maxDecompressedSize = options.maxDecompressedSize ?? config.maxDecompressedSize;
+      if (isCompressed && originalSize > maxDecompressedSize) {
+        throw new Error(
+          `Payload is ${originalSize} bytes uncompressed, over maxDecompressedSize ${maxDecompressedSize}; ` +
+          'readers with the same limit would refuse it, so nothing was published. ' +
+          'Raise maxDecompressedSize on both publisher and fetcher, or publish uncompressed.',
+        );
+      }
+
       const finalSize = calculateSize(processedContent);
 
-      // Check if chunking is needed
-      if (!needsChunking(processedContent)) {
+      // Check if chunking is needed (per-call threshold, then global default)
+      if (!needsChunking(processedContent, options.maxSingleEventSize ?? config.maxSingleEventSize)) {
         // Single event
         return await this.publishSingleEvent(
           processedContent,
@@ -159,9 +195,9 @@ export class ChunkedPublisher {
    * Delete all chunks for a given prefix
    */
   async deleteChunks(
-    kind: number,
-    dTagPrefix: string,
-    relayUrls?: string[]
+    _kind: number,
+    _dTagPrefix: string,
+    _relayUrls?: string[]
   ): Promise<{ success: boolean; deleted: number }> {
     // TODO: Implement NIP-09 deletion events
     return { success: false, deleted: 0 };
@@ -191,6 +227,7 @@ export class ChunkedPublisher {
     };
 
     const signedEvent = await this.signer.signEvent(unsignedEvent);
+    assertEventSize(signedEvent, 0, options);
 
     const pool = new RelayPool(relayUrls, {
       timeout: this.options.timeout,
@@ -200,6 +237,7 @@ export class ChunkedPublisher {
     try {
       const responses = await pool.publish(signedEvent);
       const successCount = responses.filter((r) => r.success).length;
+      const chunkResults = [toChunkResult(0, signedEvent.id, responses)];
 
       options.onProgress?.(1, 1);
 
@@ -212,7 +250,10 @@ export class ChunkedPublisher {
         publishedAt: signedEvent.created_at * 1000,
         originalSize,
         finalSize,
-        error: successCount === 0 ? 'All relays failed' : undefined,
+        chunkResults,
+        error: successCount === 0
+          ? `All relays failed${firstRejection(chunkResults) ? ` (${firstRejection(chunkResults)})` : ''}`
+          : undefined,
       };
     } finally {
       pool.close();
@@ -231,9 +272,55 @@ export class ChunkedPublisher {
     originalSize: number,
     finalSize: number
   ): Promise<PublishResult> {
-    // Create chunks
-    const chunks = createChunks(content, { dTagPrefix: options.dTagPrefix });
-    const eventIds: string[] = [];
+    // Per-call chunk size, then global default, never above the single-event
+    // threshold: a payload chunked because it is over maxSingleEventSize must
+    // not then be published as one chunk of the same size.
+    const chunkSize = Math.min(
+      options.chunkSize ?? config.chunkSize,
+      options.maxSingleEventSize ?? config.maxSingleEventSize,
+    );
+    const snapshotOptions = options.snapshot === true ? {} : options.snapshot || null;
+    const snapshot = snapshotOptions
+      ? createSnapshotChunks(content, {
+          chunkSize,
+          dTagPrefix: options.dTagPrefix,
+          snapshotId: snapshotOptions.snapshotId,
+          parents: snapshotOptions.parents,
+          recordId: snapshotOptions.recordId,
+        })
+      : null;
+    const chunks = snapshot
+      ? snapshot.chunks.map((chunk) => ({ ...chunk, dTag: chunk.dTag as string }))
+      : createChunks(content, { chunkSize, dTagPrefix: options.dTagPrefix });
+    // Sign and size-check every chunk before sending any, so an oversized
+    // chunk never leaves a partial snapshot on the relays.
+    const signedEvents: Event[] = [];
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      const tags = this.buildTags(
+        chunk.dTag,
+        chunk.index,
+        chunk.total,
+        isCompressed,
+        options.additionalTags,
+        snapshot ? snapshot.chunks[i].tags : undefined,
+      );
+
+      const unsignedEvent: UnsignedEvent = {
+        kind: options.kind,
+        pubkey,
+        created_at: Math.floor(Date.now() / 1000),
+        tags,
+        content: chunk.data,
+      };
+
+      const signedEvent = await this.signer.signEvent(unsignedEvent);
+      assertEventSize(signedEvent, chunk.index, options);
+      signedEvents.push(signedEvent);
+    }
+
+    const eventIds = signedEvents.map((event) => event.id);
+    const chunkResults: ChunkPublishResult[] = [];
     let successCount = 0;
 
     const pool = new RelayPool(relayUrls, {
@@ -242,28 +329,10 @@ export class ChunkedPublisher {
     });
 
     try {
-      for (let i = 0; i < chunks.length; i++) {
-        const chunk = chunks[i];
-        const tags = this.buildTags(
-          chunk.dTag,
-          chunk.index,
-          chunk.total,
-          isCompressed,
-          options.additionalTags
-        );
-
-        const unsignedEvent: UnsignedEvent = {
-          kind: options.kind,
-          pubkey,
-          created_at: Math.floor(Date.now() / 1000),
-          tags,
-          content: chunk.data,
-        };
-
-        const signedEvent = await this.signer.signEvent(unsignedEvent);
-        eventIds.push(signedEvent.id);
-
+      for (let i = 0; i < signedEvents.length; i++) {
+        const signedEvent = signedEvents[i];
         const responses = await pool.publish(signedEvent);
+        chunkResults.push(toChunkResult(chunks[i].index, signedEvent.id, responses));
         if (responses.some((r) => r.success)) {
           successCount++;
         }
@@ -271,6 +340,7 @@ export class ChunkedPublisher {
         options.onProgress?.(i + 1, chunks.length);
       }
 
+      const rejection = firstRejection(chunkResults);
       return {
         success: successCount === chunks.length,
         chunked: true,
@@ -280,7 +350,11 @@ export class ChunkedPublisher {
         publishedAt: Date.now(),
         originalSize,
         finalSize,
-        error: successCount < chunks.length ? `Only ${successCount}/${chunks.length} chunks published` : undefined,
+        snapshotId: snapshot?.snapshotId,
+        chunkResults,
+        error: successCount < chunks.length
+          ? `Only ${successCount}/${chunks.length} chunks published${rejection ? ` (${rejection})` : ''}`
+          : undefined,
       };
     } finally {
       pool.close();
@@ -295,7 +369,8 @@ export class ChunkedPublisher {
     chunkIndex: number | null,
     chunkTotal: number | null,
     isCompressed: boolean,
-    additionalTags?: string[][]
+    additionalTags?: string[][],
+    snapshotTags?: string[][],
   ): string[][] {
     const tags: string[][] = [
       [TAGS.D_TAG, dTag],
@@ -303,8 +378,10 @@ export class ChunkedPublisher {
       [TAGS.CLIENT, CLIENT_TAG],
     ];
 
-    // Add chunk tag if this is a chunk
-    if (chunkIndex !== null && chunkTotal !== null) {
+    if (snapshotTags) {
+      // chunk, snapshot_id, payload_hash, hash_alg, total_chunks, parents (d is already set)
+      tags.push(...snapshotTags.filter((tag) => tag[0] !== TAGS.D_TAG));
+    } else if (chunkIndex !== null && chunkTotal !== null) {
       tags.push([TAGS.CHUNK, chunkIndex.toString(), chunkTotal.toString()]);
     }
 
@@ -319,6 +396,21 @@ export class ChunkedPublisher {
     }
 
     return tags;
+  }
+}
+
+/**
+ * Throw when a signed event is larger, serialized, than the relay will take.
+ * Caught by `publish()` and returned as `{ success: false, error }`.
+ */
+function assertEventSize(event: Event, index: number, options: PublishOptions): void {
+  const limit = options.maxEventSize ?? config.maxEventSize;
+  const size = serializedEventSize(event);
+  if (size > limit) {
+    throw new Error(
+      `Event ${index} is ${size} bytes serialized, over maxEventSize ${limit}; nothing was published. ` +
+      'Lower chunkSize / maxSingleEventSize (JSON escaping can double the content size).',
+    );
   }
 }
 
