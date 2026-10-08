@@ -46,6 +46,31 @@ not collide with the fork's different 0.2.0.
   `HASH_ALG_SHA256`.
 - ESLint flat config, with a rule that keeps `Buffer`, `process`, `require` and
   `node:` imports out of `src/`.
+- **Record identity for regular kinds**: `SnapshotChunkOptions.recordId` /
+  `PublishSnapshotOptions.recordId` write a `record_id` tag on every chunk
+  (`TAGS.RECORD_ID`, same name and meaning as imani-wallet's `RECORD_ID_TAG`).
+  `SnapshotValidationOptions.recordId` filters candidates in
+  `selectBestSnapshot` / `groupChunksBySnapshot` and makes `validateSnapshot`
+  report other records' chunks as the new issue code `wrong_record`.
+  `recordIdOf(event)` reads the tag, falling back to the d-tag without
+  `-chunk-<n>`. `ChunkEventData.recordId` and `SnapshotCandidate.recordId`.
+- **Decompressed-size cap**: `decompress(b64, { maxSize })` inflates in
+  streaming mode and throws `DecompressedSizeError` once the output passes the
+  limit (default `DEFAULT_MAX_DECOMPRESSED_SIZE` = 8 MiB, via
+  `configure({ maxDecompressedSize })`, `FetcherOptions.maxDecompressedSize` or
+  `FetchOptions.maxDecompressedSize`). A 120 KB gzip bomb no longer inflates
+  to 60 MiB.
+- **Signature verification for `queryEvents`**: every event a custom source
+  returns has its id and signature checked, and failures are dropped.
+  `FetcherOptions.verifySignatures: false` opts out for sources that already
+  verify.
+- **Serialized-size check before publishing**: `PublishOptions.maxEventSize` /
+  `configure({ maxEventSize })` (default `DEFAULT_MAX_EVENT_SIZE` = 65,536).
+  Every event is signed and measured before any is sent. If one is too big,
+  nothing is published and `publish()` returns `success: false`.
+  `serializedEventSize(event)` is exported.
+- `FetchResult.unreachable` and `RelaysUnreachableError`: see Changed.
+- `LICENSE` file (MIT, as `package.json` already declared).
 
 ### Changed
 - **Browser-safe**: no Node `Buffer` anywhere. `createChunks`, `needsChunking`,
@@ -62,6 +87,33 @@ not collide with the fork's different 0.2.0.
 - Timeout timers are cleared, so they no longer keep Node processes alive.
 - `RelayPool.publish` passes `authHandler` to nostr-tools (NIP-42), which v0.1.0
   accepted but never used.
+- **Defaults are strfry-safe**: `maxSingleEventSize` and `chunkSize` drop from
+  350,000 / 300,000 to 32,000 / 32,000, so content whose bytes all double when
+  JSON-escaped still fits in strfry's 65,536-byte event limit. Pass larger
+  values (and `maxEventSize`) for relays with a looser limit.
+- The publisher caps `chunkSize` at the effective `maxSingleEventSize`. Setting
+  only a per-call `maxSingleEventSize` used to chunk the payload into one
+  oversized chunk and send it anyway.
+- `validateSnapshot` verifies `payload_hash` by default (`verifyPayloadHash`
+  now defaults to `true`). It also rejects a candidate whose chunks come from
+  more than one author or more than one record, even without
+  `expectedAuthor` / `recordId`.
+- `selectBestSnapshot` without `expectedAuthor` refuses to choose when the
+  events come from more than one author, rather than returning the newest.
+- `groupChunksBySnapshot` groups by record id and snapshot id, so two records
+  never compete with each other.
+- `RelayPool.query` connects first and throws `RelaysUnreachableError` when no
+  relay can be reached. `ChunkedFetcher.fetch` turns that, or a throwing
+  `queryEvents`, into `{ success: false, unreachable: true }` instead of
+  `error: 'No data found'`.
+- The default fetcher sorts chunk-0 candidates (and each chunk query) newest
+  first, so a stale relay listed first no longer wins.
+- The README's strfry guidance is rewritten: the old "unencrypted 60,000"
+  example overflowed strfry for quote-heavy JSON.
+- New runtime dependency `@noble/hashes` (pure-JS SHA-256), see above.
+- `npm run prepare` now builds `dist/`, so installing from git works. A git
+  install therefore needs the devDependencies (rollup, TypeScript) to be
+  installable.
 
 ### Fixed
 - **`RelayPool.publish` reported success for every relay**, including relays
@@ -110,6 +162,26 @@ Relative to v0.1.0 (the API is a superset, but these behaviours changed):
    being returned raw.
 6. Error messages for invalid chunk sets can now also be
    `Chunk index out of range: ...` or `Inconsistent chunk totals`.
+7. Chunk tags are parsed strictly: `["chunk","1abc","2"]`, `"0x1"` or `"2.5"`
+   make the event a non-chunk. v0.1.0 read them with `parseInt` and accepted
+   them.
+8. Default `maxSingleEventSize` / `chunkSize` are 32,000 (were 350,000 /
+   300,000). The same payload now produces more, smaller chunks, and readers
+   of v0.1.0-sized chunks are unaffected. Pass the old values explicitly to
+   keep the old layout.
+9. `publish()` refuses (locally, nothing sent) any event whose serialized size
+   exceeds `maxEventSize` (65,536). Raise it for relays with a looser limit.
+10. `decompress()` and the fetcher refuse output above 8 MiB.
+11. `ChunkedFetcher` with `queryEvents` drops events whose signature does not
+    verify. Sources that return unsigned or re-serialized events need
+    `verifySignatures: false`.
+12. `validateSnapshot` / `selectBestSnapshot` verify `payload_hash` by default.
+    Callers that hash something other than the concatenated chunk data (e.g.
+    plaintext before per-chunk encryption, without decrypting first) must pass
+    `verifyPayloadHash: false`. Mixed-author candidates are rejected.
+13. `RelayPool.query` throws `RelaysUnreachableError` when every relay is
+    down, rather than returning `[]`.
+14. `npm run prepare` builds `dist/`, so a git install needs devDependencies.
 
 Relative to the imani-apps fork 0.2.0: `FetcherOptions.useApi` and the implicit
 `globalThis.nostrApi` lookup are gone (see above).

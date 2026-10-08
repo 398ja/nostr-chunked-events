@@ -24,31 +24,42 @@ npm install nostr-chunked-events nostr-tools
 
 ## Size limits and defaults
 
-The defaults suit relays with a loose size limit:
+The defaults are safe for strfry, the most common relay:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `maxSingleEventSize` | 350,000 bytes | content above this is chunked |
-| `chunkSize` | 300,000 bytes | UTF-8 bytes of content per chunk |
+| `maxEventSize` | 65,536 bytes | limit on each full serialized event; checked after signing, before anything is sent |
+| `maxSingleEventSize` | 32,000 bytes | content above this is chunked |
+| `chunkSize` | 32,000 bytes | UTF-8 bytes of content per chunk (never above `maxSingleEventSize`) |
 | `maxChunks` | 1,000 | readers refuse chunk sets that claim more |
+| `maxDecompressedSize` | 8 MiB | readers refuse gzip content that inflates beyond this |
 
-**These defaults are too big for strfry.** strfry's stock `maxEventSize` is 65,536 bytes for the *entire* event, so a 300KB chunk is rejected. Pass smaller values per call (they never touch the global defaults):
+Why 32,000 and not 60,000: strfry's `maxEventSize` (65,536) applies to the *serialized* event, and JSON escaping grows content. Every `"` and `\` becomes two bytes, so a 60,000-byte chunk of JSON-in-a-string (or quote-heavy text) can serialize to well over 65,536 and be rejected. 32,000 bytes leaves room for every byte doubling plus id, pubkey, sig and tags. Content made of control characters (`\u00XX`, six bytes each) can still overflow; the publisher measures the signed event and fails locally, with nothing sent, rather than leave a partial chunk set on the relay.
+
+For a relay with a looser limit, raise all three per call (they never touch the global defaults), or globally with `configure()`:
+
+```typescript
+await publisher.publish(content, {
+  kind: 30078,
+  dTagPrefix: 'myapp-data',
+  maxEventSize: 512_000,
+  maxSingleEventSize: 300_000,
+  chunkSize: 300_000,
+});
+```
+
+Setting only `maxSingleEventSize` is enough: chunks are never larger than it.
+
+Content you NIP-44 encrypt per chunk is base64, which needs no JSON escaping, so it can use more of the budget:
 
 ```typescript
 import { STRFRY_DEFAULT_MAX_EVENT_SIZE, maxNip44PlaintextSize } from 'nostr-chunked-events';
 
-// Unencrypted content: leave room for id, pubkey, sig and tags
-await publisher.publish(content, {
-  kind: 30078,
-  dTagPrefix: 'myapp-data',
-  maxSingleEventSize: 60_000,
-  chunkSize: 60_000,
-});
-
-// Content you NIP-44 encrypt per chunk: base64 + padding inflates it ~1.5x.
 // 40,960 bytes of plaintext is the largest that fits strfry with ~1.5KB of tags.
 const chunkSize = maxNip44PlaintextSize(STRFRY_DEFAULT_MAX_EVENT_SIZE - 1_536); // 40_960
 ```
+
+`serializedEventSize(event)` measures an event the way relays do.
 
 `nip44CiphertextSize(n)` gives the exact `content` length NIP-44 v2 produces for `n` plaintext bytes. You can still change the global defaults with `configure()`.
 
@@ -120,13 +131,20 @@ result.rejectedSnapshots;   // newer candidates that failed, with reasons
 
 ### Custom query source
 
-To read through your own cache or backend instead of opening relay connections, pass `queryEvents`. Its results are still filtered to the exact author and validated:
+To read through your own cache or backend instead of opening relay connections, pass `queryEvents`. The fetcher verifies the id and signature of every event it returns and drops the ones that fail, then filters to the exact author and validates. The author filter alone only checks the `pubkey` field, which anyone can write, so do not turn verification off unless your source already verified the events:
 
 ```typescript
 const fetcher = new ChunkedFetcher({
   queryEvents: (filter) => myBackend.queryEvents(filter),
+  // verifySignatures: false,   // only if myBackend returns verified events
 });
 ```
+
+Make `queryEvents` **throw** when the backend is unreachable, not return `[]`. The fetcher then answers `{ success: false, unreachable: true }` instead of `error: 'No data found'`.
+
+### Unreachable vs. no data
+
+`result.unreachable === true` means no relay could be reached (or `queryEvents` threw): the data may well exist. Never treat it as an empty account and publish fresh state over it. `error: 'No data found'` with `unreachable` unset means a source answered and had nothing.
 
 ### With Encryption
 
@@ -161,7 +179,9 @@ if (result.success && result.content) {
 
 `ChunkedPublisher` and `ChunkedFetcher` address chunks by `d` tag (`<prefix>-chunk-<i>`, `<prefix>-state`), which only makes sense for addressable kinds (30000-39999).
 
-For regular kinds, such as NIP-60 token events (kind `7375`), use the low-level API and your own relay code. `createSnapshotChunks` adds no `d` tag unless you ask for one, and every chunk carries the tags needed to validate the set:
+For regular kinds, such as NIP-60 token events (kind `7375`), use the low-level API and your own relay code. `createSnapshotChunks` adds no `d` tag unless you ask for one, and every chunk carries the tags needed to validate the set.
+
+**Regular-kind consumers must pass `recordId`.** With a regular kind nothing else says *which* logical record a chunk belongs to: `snapshot_id` changes on every write. Without a record id, two unrelated chunked payloads of one author and kind (two coupon backups, say) look like two versions of one thing, and `selectBestSnapshot` returns whichever is newest. `recordId` writes `["record_id", <id>]` on every chunk; read it back with `selectBestSnapshot(events, { recordId })` or `validateSnapshot(chunks, { recordId })`, which reports chunks of another record as `wrong_record`. `recordIdOf(event)` returns the tag, falling back to the d-tag without `-chunk-<n>` for chunks written before the tag existed (the same rule imani-wallet uses).
 
 ```typescript
 import {
@@ -172,11 +192,12 @@ import { nip44, finalizeEvent } from 'nostr-tools';
 // Write: split the plaintext, encrypt each chunk, publish each as kind 7375
 const { chunks, snapshotId } = createSnapshotChunks(JSON.stringify(backup), {
   chunkSize: 40_960,          // fits strfry after NIP-44, see "Size limits"
+  recordId: backup.tokenId,   // required for regular kinds: which record this is
 });
 const events = chunks.map((chunk) => finalizeEvent({
   kind: 7375,
   created_at: Math.floor(Date.now() / 1000),
-  tags: chunk.tags,           // chunk, snapshot_id, payload_hash, hash_alg, total_chunks
+  tags: chunk.tags,           // record_id, chunk, snapshot_id, payload_hash, hash_alg, total_chunks
   content: nip44.v2.encrypt(chunk.data, conversationKey),
 }, secretKey));
 
@@ -190,6 +211,7 @@ const parsed = fetched
   .filter(Boolean);
 const validation = await validateSnapshot(parsed, {
   expectedAuthor: pubkey,
+  recordId: backup.tokenId,
   verifyPayloadHash: true,
   requirePayloadHash: true,
   allowIdenticalDuplicates: true,   // a retried publish of a regular event leaves a twin
@@ -199,7 +221,9 @@ if (validation.valid) {
 }
 ```
 
-When several snapshots share a kind, `groupChunksBySnapshot()` and `selectBestSnapshot()` split them by `snapshot_id` and pick the newest valid one. Deleting superseded regular events (NIP-09) is up to the caller.
+When several snapshots share a kind, `groupChunksBySnapshot()` and `selectBestSnapshot()` split them by `record_id` and `snapshot_id`, and with `recordId` set pick the newest valid snapshot of that record only.
+
+`validateSnapshot` and `selectBestSnapshot` default to the safe settings: `payload_hash` is verified when present (`verifyPayloadHash: false` to opt out), a candidate mixing authors or records is rejected, and `selectBestSnapshot` without `expectedAuthor` refuses to choose when the events come from more than one author. Always pass `expectedAuthor` anyway. Deleting superseded regular events (NIP-09) is up to the caller.
 
 ## API Reference
 
@@ -222,9 +246,16 @@ interface PublishOptions {
   relayUrls?: string[];            // Override default relays
   additionalTags?: string[][];     // Extra tags for all events
   onProgress?: (published: number, total: number) => void;
-  maxSingleEventSize?: number;     // Per-call chunking threshold
-  chunkSize?: number;              // Per-call chunk size
-  snapshot?: boolean | { snapshotId?: string; parents?: SnapshotParentReference[] };
+}
+
+interface PublishOptions {
+  kind: number;
+  dTagPrefix: string;
+  maxSingleEventSize?: number;     // Per-call chunking threshold (default 32,000)
+  chunkSize?: number;              // Per-call chunk size (default 32,000, capped at maxSingleEventSize)
+  maxEventSize?: number;           // Serialized-size check before sending (default 65,536)
+  snapshot?: boolean | { snapshotId?: string; recordId?: string; parents?: SnapshotParentReference[] };
+  // relayUrls, additionalTags, onProgress
 }
 
 interface PublishResult {
@@ -249,8 +280,10 @@ interface FetcherOptions {
   defaultRelays?: string[];
   authHandler?: (challenge: string) => Promise<Event>;
   timeout?: number;
-  queryEvents?: (filter: Filter) => Promise<Event[]>;  // custom query source
+  queryEvents?: (filter: Filter) => Promise<Event[]>;  // custom query source; throw when unreachable
+  verifySignatures?: boolean;      // check id + sig of queryEvents results (default true)
   maxChunks?: number;              // default 1,000
+  maxDecompressedSize?: number;    // default 8 MiB
 }
 
 interface FetchOptions {
@@ -262,7 +295,10 @@ interface FetchOptions {
   snapshotSelection?: SnapshotSelectionOptions;  // strict mode
   maxChunks?: number;
   verifyPayloadHash?: boolean;     // default mode: check payload_hash when present (default true)
+  maxDecompressedSize?: number;
 }
+
+// FetchResult adds `unreachable?: boolean` (see "Unreachable vs. no data").
 ```
 
 ### Low-Level API
@@ -282,16 +318,18 @@ import {
   reassembleSnapshot,
   needsChunking,
   compress,
-  decompress,
+  decompress,            // decompress(b64, { maxSize }) refuses gzip bombs
+  recordIdOf,
+  serializedEventSize,
   sha256Hex,
   nip44CiphertextSize,
   maxNip44PlaintextSize,
 } from 'nostr-chunked-events';
 
 // Check if content needs chunking
-if (needsChunking(content, 60_000)) {
+if (needsChunking(content, 32_000)) {
   const chunks = createChunks(content, {
-    chunkSize: 60_000,
+    chunkSize: 32_000,
     dTagPrefix: 'mydata'
   });
   // Manually create and publish events...
@@ -359,15 +397,17 @@ and, optionally, `["parent_snapshot_id", "..."]` / `["parent_content_hash", "...
 import { configure } from 'nostr-chunked-events';
 
 configure({
-  maxSingleEventSize: 60_000,  // Threshold to trigger chunking
-  chunkSize: 60_000,           // Size per chunk
+  maxEventSize: 65_536,        // Serialized-size limit checked before sending
+  maxSingleEventSize: 32_000,  // Threshold to trigger chunking
+  chunkSize: 32_000,           // Size per chunk
   maxChunks: 1_000,            // Readers refuse sets that claim more
+  maxDecompressedSize: 8 * 1024 * 1024,  // Readers refuse bigger gzip output
   relayTimeout: 15_000,        // Connection timeout
   relayRetries: 3              // Retry attempts (publishToRelay)
 });
 ```
 
-Per-call options (`maxSingleEventSize`, `chunkSize`, `maxChunks`) take precedence over these globals.
+Per-call options (`maxEventSize`, `maxSingleEventSize`, `chunkSize`, `maxChunks`, `maxDecompressedSize`) take precedence over these globals.
 
 ## Use Cases
 
@@ -396,4 +436,4 @@ See [CHANGELOG.md](CHANGELOG.md). In short: relay `OK=false` is now a publish fa
 
 ## License
 
-MIT
+MIT, see [LICENSE](LICENSE).
