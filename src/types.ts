@@ -400,6 +400,13 @@ export interface PublishOptions {
    */
   maxEventSize?: number;
   /**
+   * With compression applied, refuse (nothing sent) a payload whose
+   * uncompressed size is above this, because a reader with the same
+   * `maxDecompressedSize` would refuse it (default:
+   * config.maxDecompressedSize = 8 MiB). Uncompressed payloads are not capped.
+   */
+  maxDecompressedSize?: number;
+  /**
    * Tag every chunk with snapshot_id / payload_hash / hash_alg / total_chunks
    * so readers can use strict snapshot selection. `true` uses defaults.
    * Only applies when the payload is chunked. Default: off (v0.1.0 tags).
@@ -549,6 +556,13 @@ export interface FetchResult {
    * exist. Never treat an unreachable result as an empty account.
    */
   unreachable?: boolean;
+  /**
+   * True when a `queryEvents` source returned events but every one failed
+   * id/signature verification and was dropped. Like `unreachable`, the data
+   * may exist: never treat it as an empty account. Usually means the source
+   * strips or re-serializes signatures (see `verifySignatures`).
+   */
+  unverified?: boolean;
   /** Error message if failed */
   error?: string;
 }

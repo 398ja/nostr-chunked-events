@@ -42,10 +42,25 @@ const STRICT_CHUNK0_LIMIT = 10;
 const D_TAG_BATCH_SIZE = 100;
 
 /** A `queryEvents` source threw: the data may exist, we just could not ask. */
-class SourceUnreachableError extends Error {
+export class SourceUnreachableError extends Error {
   constructor(cause: unknown) {
     super(`Query source unreachable: ${cause instanceof Error ? cause.message : String(cause)}`);
     this.name = 'SourceUnreachableError';
+  }
+}
+
+/**
+ * A `queryEvents` source returned events, but every one failed id/signature
+ * verification, so nothing usable is left. The data may exist: the source may
+ * strip or re-serialize signatures. Never treat this as an empty account.
+ */
+export class SignatureVerificationError extends Error {
+  constructor(public readonly droppedCount: number) {
+    super(
+      `All ${droppedCount} event(s) from queryEvents failed signature verification and were dropped ` +
+      '(set verifySignatures: false only if the source already verifies)',
+    );
+    this.name = 'SignatureVerificationError';
   }
 }
 
@@ -56,6 +71,11 @@ function isUnreachable(error: unknown): error is Error {
 interface QuerySource {
   query: QueryEventsFn;
   close: () => void;
+  /**
+   * Called only once nothing usable was found: throw SignatureVerificationError
+   * if the author's events did arrive but all failed verification.
+   */
+  assertNotAllDropped: () => void;
 }
 
 function failure(partial: Partial<FetchResult> & { error: string }): FetchResult {
@@ -163,6 +183,7 @@ export class ChunkedFetcher {
     const queryEvents = this.options.queryEvents;
     if (queryEvents) {
       const verify = this.options.verifySignatures !== false;
+      let dropped = 0;
       return {
         query: async (filter) => {
           let events: Event[];
@@ -171,9 +192,18 @@ export class ChunkedFetcher {
           } catch (error) {
             throw new SourceUnreachableError(error);
           }
-          return verify ? events.filter(hasValidSignature) : events;
+          if (!verify) return events;
+          const valid = events.filter(hasValidSignature);
+          // Only events claiming a requested author count: a foreign event
+          // would have been discarded by the author filter anyway.
+          dropped += events.filter((event) => !valid.includes(event)
+            && (!filter.authors || filter.authors.includes(event.pubkey))).length;
+          return valid;
         },
         close: () => {},
+        assertNotAllDropped: () => {
+          if (dropped > 0) throw new SignatureVerificationError(dropped);
+        },
       };
     }
 
@@ -186,7 +216,8 @@ export class ChunkedFetcher {
       timeout: options.timeout ?? this.options.timeout,
       authHandler: this.options.authHandler,
     });
-    return { query: (filter) => pool.query(filter), close: () => pool.close() };
+    // nostr-tools' SimplePool verifies and drops bad events itself.
+    return { query: (filter) => pool.query(filter), close: () => pool.close(), assertNotAllDropped: () => {} };
   }
 
   private maxDecompressedSize(options: FetchOptions): number {
@@ -241,6 +272,7 @@ export class ChunkedFetcher {
       }), author));
 
       if (stateEvents.length === 0) {
+        source.assertNotAllDropped();
         return failure({ error: 'No data found' });
       }
 
@@ -263,6 +295,9 @@ export class ChunkedFetcher {
     } catch (error) {
       if (isUnreachable(error)) {
         return failure({ unreachable: true, error: error.message });
+      }
+      if (error instanceof SignatureVerificationError) {
+        return failure({ unverified: true, error: error.message });
       }
       return failure({ error: error instanceof Error ? error.message : 'Unknown error' });
     } finally {
@@ -302,6 +337,10 @@ export class ChunkedFetcher {
 
   /**
    * Probe for existence of chunked data without fetching all content
+   *
+   * Rejects (rather than answering `exists: false`) when the source cannot be
+   * reached (`RelaysUnreachableError`, `SourceUnreachableError`) or when every
+   * event it returned failed signature verification (`SignatureVerificationError`).
    *
    * @param pubkey - Author's public key in hex
    * @param options - Fetch options
@@ -346,6 +385,7 @@ export class ChunkedFetcher {
         return { exists: true, chunked: false, chunkCount: 1 };
       }
 
+      source.assertNotAllDropped();
       return { exists: false, chunked: false, chunkCount: 0 };
     } finally {
       source.close();

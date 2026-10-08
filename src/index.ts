@@ -12,7 +12,7 @@
 // ============================================================================
 
 export { ChunkedPublisher, createMigrationMarker } from './publisher';
-export { ChunkedFetcher } from './fetcher';
+export { ChunkedFetcher, SourceUnreachableError, SignatureVerificationError } from './fetcher';
 export { ancestryOf, supersedesRelation, MAX_WALK } from './ancestry';
 
 // ============================================================================
