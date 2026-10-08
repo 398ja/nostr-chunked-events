@@ -27,6 +27,17 @@ function errorMessage(error: unknown): string {
 }
 
 /**
+ * Thrown by {@link RelayPool.query} when not a single relay could be reached.
+ * An empty result from a reachable relay is "no data"; this is "unknown".
+ */
+export class RelaysUnreachableError extends Error {
+  constructor(public readonly relays: string[]) {
+    super(`All relays unreachable: ${relays.join(', ')}`);
+    this.name = 'RelaysUnreachableError';
+  }
+}
+
+/**
  * Managed relay pool for publishing and querying events
  */
 export class RelayPool {
@@ -81,11 +92,27 @@ export class RelayPool {
    *
    * @param filter - Nostr filter
    * @returns Array of matching events (deduplicated by event ID). On timeout
-   *   or error, returns what arrived so far (possibly []).
+   *   returns what arrived so far (possibly []).
+   * @throws RelaysUnreachableError when no relay could be connected to
    */
   async query(filter: Filter): Promise<Event[]> {
+    // Connect first so "no relay answered" is distinguishable from "no events".
+    const timeout = this.options.timeout ?? config.relayTimeout;
+    const reachable = (await Promise.all(this.urls.map(async (url) => {
+      try {
+        await this.pool.ensureRelay(url, { connectionTimeout: timeout });
+        return url;
+      } catch {
+        return null;
+      }
+    }))).filter((url): url is string => url !== null);
+
+    if (reachable.length === 0) {
+      throw new RelaysUnreachableError(this.urls);
+    }
+
     try {
-      const events = await this.pool.querySync(this.urls, filter, { maxWait: this.options.timeout });
+      const events = await this.pool.querySync(reachable, filter, { maxWait: timeout });
 
       // Deduplicate by event ID
       const seen = new Set<string>();

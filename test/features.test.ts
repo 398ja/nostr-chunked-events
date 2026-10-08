@@ -17,6 +17,8 @@ import {
   STRFRY_DEFAULT_MAX_EVENT_SIZE,
   validateSnapshot,
   config,
+  DEFAULT_CHUNK_SIZE,
+  MAX_SINGLE_EVENT_SIZE,
 } from '../src/index';
 import type { RelayPublishResponse } from '../src/index';
 
@@ -245,8 +247,8 @@ describe('ChunkedPublisher per-call thresholds and snapshot tags', () => {
     expect(result.success).toBe(true);
     expect(result.chunkCount).toBe(4);
     expect(published.map((e) => e.content.length)).toEqual([3000, 3000, 3000, 1000]);
-    expect(config.maxSingleEventSize).toBe(350_000);
-    expect(config.chunkSize).toBe(300_000);
+    expect(config.maxSingleEventSize).toBe(MAX_SINGLE_EVENT_SIZE);
+    expect(config.chunkSize).toBe(DEFAULT_CHUNK_SIZE);
   });
 
   it('adds snapshot integrity tags when snapshot is enabled', async () => {

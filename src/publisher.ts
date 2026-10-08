@@ -3,8 +3,15 @@
  * Handles automatic chunking and publishing of large content
  */
 
-import type { UnsignedEvent } from 'nostr-tools';
-import { createChunks, createSnapshotChunks, needsChunking, calculateSize, getSingleEventDTag } from './chunker';
+import type { Event, UnsignedEvent } from 'nostr-tools';
+import {
+  createChunks,
+  createSnapshotChunks,
+  needsChunking,
+  calculateSize,
+  getSingleEventDTag,
+  serializedEventSize,
+} from './chunker';
 import { compress } from './compression';
 import { RelayPool } from './relay';
 import { TAGS, LIBRARY_VERSION, CLIENT_TAG, COMPRESSION, config } from './constants';
@@ -209,6 +216,7 @@ export class ChunkedPublisher {
     };
 
     const signedEvent = await this.signer.signEvent(unsignedEvent);
+    assertEventSize(signedEvent, 0, options);
 
     const pool = new RelayPool(relayUrls, {
       timeout: this.options.timeout,
@@ -253,8 +261,13 @@ export class ChunkedPublisher {
     originalSize: number,
     finalSize: number
   ): Promise<PublishResult> {
-    // Create chunks (per-call chunk size, then global default)
-    const chunkSize = options.chunkSize ?? config.chunkSize;
+    // Per-call chunk size, then global default, never above the single-event
+    // threshold: a payload chunked because it is over maxSingleEventSize must
+    // not then be published as one chunk of the same size.
+    const chunkSize = Math.min(
+      options.chunkSize ?? config.chunkSize,
+      options.maxSingleEventSize ?? config.maxSingleEventSize,
+    );
     const snapshotOptions = options.snapshot === true ? {} : options.snapshot || null;
     const snapshot = snapshotOptions
       ? createSnapshotChunks(content, {
@@ -262,12 +275,40 @@ export class ChunkedPublisher {
           dTagPrefix: options.dTagPrefix,
           snapshotId: snapshotOptions.snapshotId,
           parents: snapshotOptions.parents,
+          recordId: snapshotOptions.recordId,
         })
       : null;
     const chunks = snapshot
       ? snapshot.chunks.map((chunk) => ({ ...chunk, dTag: chunk.dTag as string }))
       : createChunks(content, { chunkSize, dTagPrefix: options.dTagPrefix });
-    const eventIds: string[] = [];
+    // Sign and size-check every chunk before sending any, so an oversized
+    // chunk never leaves a partial snapshot on the relays.
+    const signedEvents: Event[] = [];
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      const tags = this.buildTags(
+        chunk.dTag,
+        chunk.index,
+        chunk.total,
+        isCompressed,
+        options.additionalTags,
+        snapshot ? snapshot.chunks[i].tags : undefined,
+      );
+
+      const unsignedEvent: UnsignedEvent = {
+        kind: options.kind,
+        pubkey,
+        created_at: Math.floor(Date.now() / 1000),
+        tags,
+        content: chunk.data,
+      };
+
+      const signedEvent = await this.signer.signEvent(unsignedEvent);
+      assertEventSize(signedEvent, chunk.index, options);
+      signedEvents.push(signedEvent);
+    }
+
+    const eventIds = signedEvents.map((event) => event.id);
     const chunkResults: ChunkPublishResult[] = [];
     let successCount = 0;
 
@@ -277,30 +318,10 @@ export class ChunkedPublisher {
     });
 
     try {
-      for (let i = 0; i < chunks.length; i++) {
-        const chunk = chunks[i];
-        const tags = this.buildTags(
-          chunk.dTag,
-          chunk.index,
-          chunk.total,
-          isCompressed,
-          options.additionalTags,
-          snapshot ? snapshot.chunks[i].tags : undefined,
-        );
-
-        const unsignedEvent: UnsignedEvent = {
-          kind: options.kind,
-          pubkey,
-          created_at: Math.floor(Date.now() / 1000),
-          tags,
-          content: chunk.data,
-        };
-
-        const signedEvent = await this.signer.signEvent(unsignedEvent);
-        eventIds.push(signedEvent.id);
-
+      for (let i = 0; i < signedEvents.length; i++) {
+        const signedEvent = signedEvents[i];
         const responses = await pool.publish(signedEvent);
-        chunkResults.push(toChunkResult(chunk.index, signedEvent.id, responses));
+        chunkResults.push(toChunkResult(chunks[i].index, signedEvent.id, responses));
         if (responses.some((r) => r.success)) {
           successCount++;
         }
@@ -364,6 +385,21 @@ export class ChunkedPublisher {
     }
 
     return tags;
+  }
+}
+
+/**
+ * Throw when a signed event is larger, serialized, than the relay will take.
+ * Caught by `publish()` and returned as `{ success: false, error }`.
+ */
+function assertEventSize(event: Event, index: number, options: PublishOptions): void {
+  const limit = options.maxEventSize ?? config.maxEventSize;
+  const size = serializedEventSize(event);
+  if (size > limit) {
+    throw new Error(
+      `Event ${index} is ${size} bytes serialized, over maxEventSize ${limit}; nothing was published. ` +
+      'Lower chunkSize / maxSingleEventSize (JSON escaping can double the content size).',
+    );
   }
 }
 

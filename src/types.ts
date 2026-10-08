@@ -50,6 +50,8 @@ export interface ChunkMetadata {
   eventId?: string;
   /** Source event d-tag */
   dTag?: string;
+  /** Logical record id: the `record_id` tag, else the d-tag without `-chunk-<n>` */
+  recordId?: string;
   /** Parent ancestry references (undefined for legacy pre-ancestry snapshots) */
   parents?: SnapshotParentReference[];
 }
@@ -100,6 +102,14 @@ export interface SnapshotChunkOptions {
    * At most two parents (a merge).
    */
   parents?: SnapshotParentReference[];
+  /**
+   * Logical record id, written as `["record_id", recordId]` on every chunk.
+   * **Required in practice for regular kinds** (e.g. 7375): without it, two
+   * unrelated chunked payloads of one author and kind look like versions of
+   * the same thing and the newest wins. Read it back with
+   * `selectBestSnapshot(events, { recordId })`.
+   */
+  recordId?: string;
 }
 
 /**
@@ -158,6 +168,7 @@ export interface SnapshotValidationIssue {
   code:
     | 'empty'
     | 'wrong_author'
+    | 'wrong_record'
     | 'mixed_snapshot'
     | 'duplicate_index'
     | 'missing_snapshot_id'
@@ -179,15 +190,28 @@ export interface SnapshotValidationIssue {
  * Options for strict snapshot validation
  */
 export interface SnapshotValidationOptions {
-  /** Require all events to match this author */
+  /**
+   * Require all events to match this author. Without it, a candidate whose
+   * chunks come from more than one author is still rejected (`wrong_author`).
+   */
   expectedAuthor?: string;
+  /**
+   * Require every chunk to belong to this logical record (`record_id` tag, or
+   * d-tag prefix as a fallback). Chunks of another record are `wrong_record`.
+   * Even without it, a candidate mixing two records is rejected.
+   */
+  recordId?: string;
   /** Require consistent metadata across the candidate set (default: true) */
   requireConsistentMetadata?: boolean;
   /** Require snapshot_id on all chunks when strict metadata is in use */
   requireSnapshotId?: boolean;
   /** Require payload_hash on all chunks when strict metadata is in use */
   requirePayloadHash?: boolean;
-  /** Verify reconstructed payload hash when payload_hash is present */
+  /**
+   * Verify the reconstructed payload against `payload_hash` when present
+   * (default: true). Set false only if the writer hashed something other than
+   * the concatenated chunk data, e.g. plaintext before per-chunk encryption.
+   */
   verifyPayloadHash?: boolean;
   /** Allow legacy chunk sets without strict metadata (default: true) */
   allowLegacy?: boolean;
@@ -246,6 +270,8 @@ export interface AncestrySnapshotLike {
 export interface SnapshotCandidate {
   /** Snapshot ID shared by grouped chunks, or null for legacy groups */
   snapshotId: string | null;
+  /** Record id shared by grouped chunks, if any */
+  recordId?: string;
   /** Newest timestamp seen in this candidate */
   newestCreatedAt: number;
   /** Raw parsed chunks that belong to this candidate */
@@ -256,6 +282,7 @@ export interface SnapshotCandidate {
  * Options for choosing the best chunk snapshot
  */
 export interface SnapshotSelectionOptions extends SnapshotValidationOptions {
+  // `recordId` (inherited) also filters candidates: only that record's chunks are considered.
   /** How to choose among competing snapshots (default: newest-valid) */
   strategy?: 'newest-valid' | 'newest-seen';
 }
@@ -333,6 +360,8 @@ export interface PublisherOptions {
 export interface PublishSnapshotOptions {
   /** Snapshot id (default: random UUID) */
   snapshotId?: string;
+  /** Logical record id, written as a `record_id` tag on every chunk */
+  recordId?: string;
   /** Ancestry parents; `[]` marks genesis, omit for no ancestry tags */
   parents?: SnapshotParentReference[];
 }
@@ -353,12 +382,23 @@ export interface PublishOptions {
   onProgress?: (published: number, total: number) => void;
   /**
    * Content size (bytes) above which the payload is chunked, for this call
-   * (default: config.maxSingleEventSize = 350,000). For strfry (maxEventSize
-   * 65,536 for the whole event) use something well under 64KB.
+   * (default: config.maxSingleEventSize = 32,000). Chunks are never larger
+   * than this either, so setting it alone is enough.
    */
   maxSingleEventSize?: number;
-  /** Bytes per chunk for this call (default: config.chunkSize = 300,000) */
+  /**
+   * Bytes per chunk for this call (default: config.chunkSize = 32,000).
+   * Capped at the effective `maxSingleEventSize`.
+   */
   chunkSize?: number;
+  /**
+   * Limit on each full serialized signed event (id, pubkey, sig, tags and
+   * JSON-escaped content), for this call (default: config.maxEventSize =
+   * 65,536, strfry's stock limit). Every event is checked after signing and
+   * before anything is sent; if one is over, nothing is published and the
+   * result says so.
+   */
+  maxEventSize?: number;
   /**
    * Tag every chunk with snapshot_id / payload_hash / hash_alg / total_chunks
    * so readers can use strict snapshot selection. `true` uses defaults.
@@ -413,8 +453,10 @@ export interface PublishResult {
 
 /**
  * Custom query function. Lets callers route reads through their own cache,
- * backend or relay pool instead of the built-in RelayPool. Results are still
- * filtered to the exact author and validated.
+ * backend or relay pool instead of the built-in RelayPool. Results are
+ * signature-checked (unless `verifySignatures: false`), filtered to the exact
+ * author and validated. Throw (rather than return `[]`) when the source is
+ * unreachable, so the fetcher can report `unreachable` instead of "No data found".
  */
 export type QueryEventsFn = (filter: Filter) => Promise<Event[]>;
 
@@ -435,6 +477,16 @@ export interface FetcherOptions {
   queryEvents?: QueryEventsFn;
   /** Maximum chunk count accepted from chunk-0 (default: config.maxChunks) */
   maxChunks?: number;
+  /**
+   * Verify the id and Schnorr signature of every event a `queryEvents` source
+   * returns (default: true). Events that fail are dropped. Set false only if
+   * your source already verified them; the author filter alone trusts the
+   * `pubkey` field, which anyone can write. The built-in relay pool always
+   * verifies (nostr-tools does it).
+   */
+  verifySignatures?: boolean;
+  /** Largest decompressed payload accepted (default: config.maxDecompressedSize = 8 MiB) */
+  maxDecompressedSize?: number;
 }
 
 /**
@@ -462,6 +514,8 @@ export interface FetchOptions {
    * plaintext before per-chunk encryption.
    */
   verifyPayloadHash?: boolean;
+  /** Largest decompressed payload accepted for this call (default: FetcherOptions.maxDecompressedSize) */
+  maxDecompressedSize?: number;
 }
 
 /**
@@ -489,6 +543,12 @@ export interface FetchResult {
     snapshotId: string | null;
     issues: SnapshotValidationIssue[];
   }>;
+  /**
+   * True when the source could not be reached (every relay failed to connect,
+   * or `queryEvents` threw). Then `error` is not "No data found": the data may
+   * exist. Never treat an unreachable result as an empty account.
+   */
+  unreachable?: boolean;
   /** Error message if failed */
   error?: string;
 }

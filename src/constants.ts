@@ -2,21 +2,36 @@
  * Default configuration values for the library
  */
 
-/**
- * Maximum content size for a single event before chunking is triggered (350KB).
- *
- * This default suits relays with a loose event size limit. strfry's stock
- * `events.maxEventSize` is 65,536 bytes for the WHOLE serialized event (id,
- * pubkey, sig, tags and content), so for strfry pass a much smaller
- * `maxSingleEventSize` / `chunkSize` per call. See {@link STRFRY_DEFAULT_MAX_EVENT_SIZE}.
- */
-export const MAX_SINGLE_EVENT_SIZE = 350_000;
-
-/** Maximum size for each chunk (300KB). Same caveat as {@link MAX_SINGLE_EVENT_SIZE}. */
-export const DEFAULT_CHUNK_SIZE = 300_000;
-
 /** strfry's stock `events.maxEventSize`: the limit on the full serialized event, in bytes. */
 export const STRFRY_DEFAULT_MAX_EVENT_SIZE = 65_536;
+
+/**
+ * Default limit on the full serialized event (id, pubkey, sig, tags and
+ * content after JSON escaping), checked before anything is sent. Matches
+ * strfry's stock limit, the most common relay. Raise it for relays with a
+ * looser limit.
+ */
+export const DEFAULT_MAX_EVENT_SIZE = STRFRY_DEFAULT_MAX_EVENT_SIZE;
+
+/**
+ * Content size (UTF-8 bytes) above which a payload is chunked (32,000).
+ *
+ * Under half of {@link DEFAULT_MAX_EVENT_SIZE}: content whose every byte
+ * doubles when JSON-escaped (`"` and `\\`), plus id, pubkey, sig and tags,
+ * still fits in 65,536. Content full of control characters (`\u00XX`, six
+ * bytes each) can still exceed it; the publisher's serialized-size check
+ * refuses such an event locally instead of sending it.
+ */
+export const MAX_SINGLE_EVENT_SIZE = 32_000;
+
+/** Maximum payload bytes per chunk (32,000). Same reasoning as {@link MAX_SINGLE_EVENT_SIZE}. */
+export const DEFAULT_CHUNK_SIZE = 32_000;
+
+/**
+ * Largest decompressed payload a reader accepts (8 MiB). Gzip expands zeros
+ * about 1000:1, so without a cap one 60 KB event could inflate to 60 MB.
+ */
+export const DEFAULT_MAX_DECOMPRESSED_SIZE = 8 * 1024 * 1024;
 
 /**
  * Upper bound on the number of chunks a reader will accept for one payload.
@@ -53,6 +68,12 @@ export const TAGS = {
   HASH_ALG: 'hash_alg',
   /** Explicit total chunk count */
   TOTAL_CHUNKS: 'total_chunks',
+  /**
+   * Logical record a chunk belongs to, for regular kinds (e.g. 7375) where
+   * several unrelated chunked payloads share one author and kind. Same name
+   * and meaning as imani-wallet's `RECORD_ID_TAG`.
+   */
+  RECORD_ID: 'record_id',
   /** Snapshot ancestry parent snapshot id (repeatable, order-sensitive) */
   PARENT_SNAPSHOT_ID: 'parent_snapshot_id',
   /** Snapshot ancestry parent content hash (repeatable, order-sensitive) */
@@ -88,6 +109,8 @@ export const config = {
   maxSingleEventSize: MAX_SINGLE_EVENT_SIZE,
   chunkSize: DEFAULT_CHUNK_SIZE,
   maxChunks: DEFAULT_MAX_CHUNKS,
+  maxEventSize: DEFAULT_MAX_EVENT_SIZE,
+  maxDecompressedSize: DEFAULT_MAX_DECOMPRESSED_SIZE,
   relayTimeout: DEFAULT_RELAY_TIMEOUT,
   relayRetries: DEFAULT_RELAY_RETRIES,
 };
@@ -104,6 +127,12 @@ export function configure(options: Partial<typeof config>): void {
   }
   if (options.maxChunks !== undefined) {
     config.maxChunks = options.maxChunks;
+  }
+  if (options.maxEventSize !== undefined) {
+    config.maxEventSize = options.maxEventSize;
+  }
+  if (options.maxDecompressedSize !== undefined) {
+    config.maxDecompressedSize = options.maxDecompressedSize;
   }
   if (options.relayTimeout !== undefined) {
     config.relayTimeout = options.relayTimeout;

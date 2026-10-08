@@ -5,6 +5,7 @@
 import type { Event } from 'nostr-tools';
 import { config, HASH_ALG_SHA256, TAGS } from './constants';
 import { sha256Hex } from './hash';
+import { parseDTag } from './chunker';
 import type {
   AncestrySnapshotLike,
   ChunkData,
@@ -203,9 +204,27 @@ export function parseChunkEvent(event: Event): ChunkEventData | null {
     createdAt: event.created_at,
     eventId: event.id,
     dTag: getTagValue(event, TAGS.D_TAG),
+    recordId: recordIdOf(event),
     parents: parseParentReferences(event),
     rawEvent: event,
   };
+}
+
+/**
+ * The logical record an event belongs to: its `record_id` tag, else (for a
+ * chunk) its d-tag without `-chunk-<n>`, else (for a non-chunk) its d-tag.
+ * The same rule as imani-wallet's `recordIdOf`, so chunks written before the
+ * `record_id` tag existed still resolve to their record.
+ */
+export function recordIdOf(event: Pick<Event, 'tags'>): string | undefined {
+  const d = event.tags.find((tag) => tag[0] === TAGS.D_TAG)?.[1];
+  const isChunk = event.tags.some((tag) => tag[0] === TAGS.CHUNK);
+  if (!isChunk) return d || undefined;
+  const explicit = event.tags.find((tag) => tag[0] === TAGS.RECORD_ID)?.[1];
+  if (explicit) return explicit;
+  if (!d) return undefined;
+  const parsed = parseDTag(d);
+  return parsed.chunkIndex === null ? undefined : parsed.prefix;
 }
 
 /**
@@ -353,7 +372,7 @@ export function validateChunks(chunks: ChunkData[], options: ChunkValidationOpti
  */
 export function groupChunksBySnapshot(
   events: Event[],
-  options: { expectedAuthor?: string } = {},
+  options: { expectedAuthor?: string; recordId?: string } = {},
 ): SnapshotCandidate[] {
   const filteredEvents = options.expectedAuthor
     ? filterEventsByAuthor(events, options.expectedAuthor)
@@ -372,12 +391,15 @@ export function groupChunksBySnapshot(
       return true;
     })
     .map((event) => parseChunkEvent(event))
-    .filter((chunk): chunk is ChunkEventData => chunk !== null);
+    .filter((chunk): chunk is ChunkEventData => chunk !== null)
+    .filter((chunk) => options.recordId === undefined || chunk.recordId === options.recordId);
 
   const groups = new Map<string, ChunkEventData[]>();
 
   for (const chunk of parsedChunks) {
-    const key = chunk.snapshotId ?? '__legacy__';
+    // One candidate per (record, snapshot): two records never compete, even
+    // if they happen to share a snapshot_id.
+    const key = JSON.stringify([chunk.recordId ?? null, chunk.snapshotId ?? null]);
     const existing = groups.get(key);
     if (existing) {
       existing.push(chunk);
@@ -386,8 +408,9 @@ export function groupChunksBySnapshot(
     }
   }
 
-  return Array.from(groups.entries()).map(([key, chunks]) => ({
-    snapshotId: key === '__legacy__' ? null : key,
+  return Array.from(groups.values()).map((chunks) => ({
+    snapshotId: chunks[0].snapshotId ?? null,
+    recordId: chunks[0].recordId,
     newestCreatedAt: chunks.reduce((max, chunk) => Math.max(max, chunk.createdAt ?? 0), 0),
     chunks,
   }));
@@ -424,6 +447,33 @@ export async function validateSnapshot(
         });
       }
     }
+  }
+
+  const authors = new Set(chunks.map((chunk) => chunk.author).filter((value): value is string => Boolean(value)));
+  if (!options.expectedAuthor && authors.size > 1) {
+    issues.push({
+      code: 'wrong_author',
+      message: `Candidate mixes chunks from ${authors.size} authors; pass expectedAuthor`,
+    });
+  }
+
+  const recordIds = new Set(chunks.map((chunk) => chunk.recordId));
+  if (options.recordId !== undefined) {
+    for (const chunk of chunks) {
+      if (chunk.recordId !== options.recordId) {
+        issues.push({
+          code: 'wrong_record',
+          message: `Chunk record mismatch: expected ${options.recordId}, got ${chunk.recordId ?? '(none)'}`,
+          chunkIndex: chunk.index,
+          eventId: chunk.eventId,
+        });
+      }
+    }
+  } else if (recordIds.size > 1) {
+    issues.push({
+      code: 'wrong_record',
+      message: 'Candidate mixes chunks from more than one record_id',
+    });
   }
 
   const uniqueChunks = dedupeChunksByEventId(chunks);
@@ -610,7 +660,7 @@ export async function validateSnapshot(
   }
 
   let payloadHashVerified = false;
-  if (issues.length === 0 && options.verifyPayloadHash && payloadHashes.size === 1) {
+  if (issues.length === 0 && options.verifyPayloadHash !== false && payloadHashes.size === 1) {
     const expectedPayloadHash = Array.from(payloadHashes)[0];
     const algorithm = normalizedHashAlg ?? 'sha256';
     const reassembled = sortedChunks.map((chunk) => chunk.data).join('');
@@ -656,8 +706,21 @@ export async function selectBestSnapshot(
   options: SnapshotSelectionOptions = {},
 ): Promise<SnapshotSelectionResult> {
   const strategy = options.strategy ?? 'newest-valid';
-  const candidates = groupChunksBySnapshot(events, { expectedAuthor: options.expectedAuthor })
+  const candidates = groupChunksBySnapshot(events, { expectedAuthor: options.expectedAuthor, recordId: options.recordId })
     .sort((a, b) => b.newestCreatedAt - a.newestCreatedAt);
+
+  // Without expectedAuthor, "newest" across several authors would let anyone
+  // who can publish a newer snapshot win. Refuse to choose instead.
+  const authors = new Set(candidates.flatMap((candidate) => candidate.chunks.map((chunk) => chunk.author)));
+  const ambiguousAuthor: SnapshotValidationIssue | null = !options.expectedAuthor && authors.size > 1
+    ? { code: 'wrong_author', message: `Events come from ${authors.size} authors; pass expectedAuthor to choose` }
+    : null;
+  const validate = async (chunks: ChunkEventData[]): Promise<SnapshotValidationResult> => {
+    const validation = await validateSnapshot(chunks, options);
+    return ambiguousAuthor
+      ? { ...validation, valid: false, payloadHashVerified: false, issues: [...validation.issues, ambiguousAuthor] }
+      : validation;
+  };
 
   const rejected: SnapshotSelectionResult['rejected'] = [];
 
@@ -671,7 +734,7 @@ export async function selectBestSnapshot(
       };
     }
 
-    const validation = await validateSnapshot(newest.chunks, options);
+    const validation = await validate(newest.chunks);
     const normalizedCandidate: SnapshotCandidate = {
       ...newest,
       snapshotId: validation.snapshotId,
@@ -699,7 +762,7 @@ export async function selectBestSnapshot(
   }
 
   for (const candidate of candidates) {
-    const validation = await validateSnapshot(candidate.chunks, options);
+    const validation = await validate(candidate.chunks);
     const normalizedCandidate: SnapshotCandidate = {
       ...candidate,
       snapshotId: validation.snapshotId,

@@ -6,6 +6,7 @@
  * whatever the source (relays or a custom `queryEvents` function).
  */
 
+import { verifyEvent } from 'nostr-tools';
 import type { Event, Filter } from 'nostr-tools';
 import {
   describeChunkValidationFailure,
@@ -22,7 +23,7 @@ import {
 } from './reassembler';
 import { getChunkDTag, getSingleEventDTag } from './chunker';
 import { decompress } from './compression';
-import { RelayPool } from './relay';
+import { RelayPool, RelaysUnreachableError } from './relay';
 import { config } from './constants';
 import type {
   ChunkData,
@@ -39,6 +40,18 @@ const STRICT_CHUNK0_LIMIT = 10;
 
 /** d-tags per query when fetching many chunks, to stay under relay filter limits */
 const D_TAG_BATCH_SIZE = 100;
+
+/** A `queryEvents` source threw: the data may exist, we just could not ask. */
+class SourceUnreachableError extends Error {
+  constructor(cause: unknown) {
+    super(`Query source unreachable: ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = 'SourceUnreachableError';
+  }
+}
+
+function isUnreachable(error: unknown): error is Error {
+  return error instanceof SourceUnreachableError || error instanceof RelaysUnreachableError;
+}
 
 interface QuerySource {
   query: QueryEventsFn;
@@ -62,17 +75,47 @@ function failure(partial: Partial<FetchResult> & { error: string }): FetchResult
  * a payload that claims to be compressed but does not decompress is an error,
  * not silently returned as-is.
  */
-function decodeContent(content: string, event: Event): { content: string; compressed: boolean } {
+function decodeContent(
+  content: string,
+  event: Event,
+  maxSize: number,
+): { content: string; compressed: boolean } {
   const compressed = getCompressionType(event) !== null;
   if (!compressed) {
     return { content, compressed };
   }
   try {
-    return { content: decompress(content), compressed };
+    return { content: decompress(content, { maxSize }), compressed };
   } catch (error) {
     throw new Error(`Content is tagged compressed but failed to decompress: ${
       error instanceof Error ? error.message : String(error)
     }`);
+  }
+}
+
+/** Newest first, so a stale relay's copy never beats a fresh one. */
+function newestFirst(events: Event[]): Event[] {
+  return [...events].sort((a, b) => b.created_at - a.created_at);
+}
+
+/**
+ * Check id and signature on a copy holding only the event fields. nostr-tools
+ * caches a verification result on the event object under a symbol, which an
+ * object spread would carry over to a tampered copy.
+ */
+function hasValidSignature(event: Event): boolean {
+  try {
+    return verifyEvent({
+      id: event.id,
+      pubkey: event.pubkey,
+      created_at: event.created_at,
+      kind: event.kind,
+      tags: event.tags,
+      content: event.content,
+      sig: event.sig,
+    });
+  } catch {
+    return false;
   }
 }
 
@@ -111,12 +154,27 @@ export class ChunkedFetcher {
       timeout: options?.timeout,
       queryEvents: options?.queryEvents,
       maxChunks: options?.maxChunks,
+      verifySignatures: options?.verifySignatures,
+      maxDecompressedSize: options?.maxDecompressedSize,
     };
   }
 
   private openSource(options: FetchOptions): QuerySource | null {
-    if (this.options.queryEvents) {
-      return { query: this.options.queryEvents, close: () => {} };
+    const queryEvents = this.options.queryEvents;
+    if (queryEvents) {
+      const verify = this.options.verifySignatures !== false;
+      return {
+        query: async (filter) => {
+          let events: Event[];
+          try {
+            events = await queryEvents(filter);
+          } catch (error) {
+            throw new SourceUnreachableError(error);
+          }
+          return verify ? events.filter(hasValidSignature) : events;
+        },
+        close: () => {},
+      };
     }
 
     const relayUrls = options.relayUrls ?? this.options.defaultRelays ?? [];
@@ -129,6 +187,10 @@ export class ChunkedFetcher {
       authHandler: this.options.authHandler,
     });
     return { query: (filter) => pool.query(filter), close: () => pool.close() };
+  }
+
+  private maxDecompressedSize(options: FetchOptions): number {
+    return options.maxDecompressedSize ?? this.options.maxDecompressedSize ?? config.maxDecompressedSize;
   }
 
   private maxChunks(options: FetchOptions): number {
@@ -162,7 +224,7 @@ export class ChunkedFetcher {
         limit: useStrictSelection ? STRICT_CHUNK0_LIMIT : 1,
       };
 
-      const chunk0Events = filterEventsByAuthor(await source.query(chunk0Filter), author);
+      const chunk0Events = newestFirst(filterEventsByAuthor(await source.query(chunk0Filter), author));
 
       if (chunk0Events.length > 0) {
         return useStrictSelection
@@ -171,12 +233,12 @@ export class ChunkedFetcher {
       }
 
       // No chunked data found - try single event format
-      const stateEvents = filterEventsByAuthor(await source.query({
+      const stateEvents = newestFirst(filterEventsByAuthor(await source.query({
         kinds: [options.kind],
         authors: [author],
         '#d': [getSingleEventDTag(options.dTagPrefix)],
         limit: 1,
-      }), author);
+      }), author));
 
       if (stateEvents.length === 0) {
         return failure({ error: 'No data found' });
@@ -188,7 +250,7 @@ export class ChunkedFetcher {
         return failure({ events: [stateEvent], error: 'Data migrated to chunks but chunks not found' });
       }
 
-      const decoded = decodeContent(stateEvent.content, stateEvent);
+      const decoded = decodeContent(stateEvent.content, stateEvent, this.maxDecompressedSize(options));
       return {
         success: true,
         content: decoded.content,
@@ -199,6 +261,9 @@ export class ChunkedFetcher {
         snapshotId: null,
       };
     } catch (error) {
+      if (isUnreachable(error)) {
+        return failure({ unreachable: true, error: error.message });
+      }
       return failure({ error: error instanceof Error ? error.message : 'Unknown error' });
     } finally {
       source.close();
@@ -369,7 +434,7 @@ export class ChunkedFetcher {
         validationOptions,
       );
       const firstEvent = selection.selected.chunks[0]?.rawEvent ?? chunk0Events[0];
-      const decoded = decodeContent(reassembled, firstEvent);
+      const decoded = decodeContent(reassembled, firstEvent, this.maxDecompressedSize(options));
 
       return {
         success: true,
@@ -438,7 +503,7 @@ export class ChunkedFetcher {
       );
 
       for (const events of results) {
-        const [event] = filterEventsByAuthor(events, author);
+        const [event] = newestFirst(filterEventsByAuthor(events, author));
         if (!event) {
           continue;
         }
@@ -469,7 +534,7 @@ export class ChunkedFetcher {
       }
 
       const reassembled = reassembleChunks(allChunks, { maxChunks });
-      const decoded = decodeContent(reassembled, chunk0Event);
+      const decoded = decodeContent(reassembled, chunk0Event, this.maxDecompressedSize(options));
 
       return {
         success: true,

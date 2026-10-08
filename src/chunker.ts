@@ -155,6 +155,10 @@ function randomSnapshotId(): string {
  * so the result suits regular kinds (e.g. NIP-60 kind 7375) as well as
  * addressable kinds (30000-39999).
  *
+ * For regular kinds, pass `recordId`: it is the only thing that tells one
+ * logical record's snapshots apart from another's (`snapshot_id` changes on
+ * every write). Read with `selectBestSnapshot(events, { recordId })`.
+ *
  * Unlike `createChunks`, a payload that fits in one chunk still yields one
  * chunk with full metadata (total 1), so readers handle every size the same way.
  *
@@ -171,6 +175,9 @@ export function createSnapshotChunks(content: string, options?: SnapshotChunkOpt
     throw new RangeError('Cannot create a snapshot from an empty payload');
   }
 
+  if (options?.recordId !== undefined && options.recordId === '') {
+    throw new RangeError('recordId must not be empty');
+  }
   const snapshotId = options?.snapshotId ?? randomSnapshotId();
   const payloadHash = sha256Hex(content);
   const pieces = splitUtf8(encoder.encode(content), chunkSize);
@@ -201,6 +208,9 @@ export function createSnapshotChunks(content: string, options?: SnapshotChunkOpt
     if (dTag !== undefined) {
       tags.push([TAGS.D_TAG, dTag]);
     }
+    if (options?.recordId !== undefined) {
+      tags.push([TAGS.RECORD_ID, options.recordId]);
+    }
     tags.push(
       [TAGS.CHUNK, String(index), String(total)],
       [TAGS.SNAPSHOT_ID, snapshotId],
@@ -213,6 +223,25 @@ export function createSnapshotChunks(content: string, options?: SnapshotChunkOpt
   });
 
   return { snapshotId, payloadHash, hashAlg: HASH_ALG_SHA256, totalChunks: total, chunks };
+}
+
+/**
+ * Size in bytes of an event as relays measure it: the UTF-8 length of its JSON
+ * serialization (id, pubkey, created_at, kind, tags, content, sig), with
+ * content and tags JSON-escaped. strfry's `maxEventSize` applies to this.
+ */
+export function serializedEventSize(event: {
+  id?: string; pubkey?: string; created_at: number; kind: number; tags: string[][]; content: string; sig?: string;
+}): number {
+  return encoder.encode(JSON.stringify({
+    id: event.id ?? '0'.repeat(64),
+    pubkey: event.pubkey ?? '0'.repeat(64),
+    created_at: event.created_at,
+    kind: event.kind,
+    tags: event.tags,
+    content: event.content,
+    sig: event.sig ?? '0'.repeat(128),
+  })).length;
 }
 
 /**

@@ -29,6 +29,7 @@ export {
   getSingleEventDTag,
   getChunkDTag,
   parseDTag,
+  serializedEventSize,
 } from './chunker';
 
 // Reassembly
@@ -43,6 +44,7 @@ export {
   validateSnapshot,
   selectBestSnapshot,
   reassembleSnapshot,
+  recordIdOf,
   describeChunkValidationFailure,
   isGenesis,
   isMergeSnapshot,
@@ -60,7 +62,9 @@ export {
   decompress,
   isCompressed,
   tryDecompress,
+  DecompressedSizeError,
 } from './compression';
+export type { DecompressOptions } from './compression';
 
 // Hashing and size budgeting
 export {
@@ -71,7 +75,7 @@ export {
 } from './hash';
 
 // Relay utilities
-export { RelayPool, publishToRelay, queryRelay } from './relay';
+export { RelayPool, RelaysUnreachableError, publishToRelay, queryRelay } from './relay';
 
 // ============================================================================
 // Configuration
@@ -84,6 +88,8 @@ export {
   DEFAULT_CHUNK_SIZE,
   DEFAULT_MAX_CHUNKS,
   STRFRY_DEFAULT_MAX_EVENT_SIZE,
+  DEFAULT_MAX_EVENT_SIZE,
+  DEFAULT_MAX_DECOMPRESSED_SIZE,
   HASH_ALG_SHA256,
   DEFAULT_RELAY_TIMEOUT,
   DEFAULT_RELAY_RETRIES,
