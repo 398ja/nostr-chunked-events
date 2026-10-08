@@ -124,6 +124,17 @@ export class ChunkedPublisher {
         }
       }
 
+      // Readers refuse gzip output above maxDecompressedSize (a bomb guard
+      // that must not follow the writer), so never write what they refuse.
+      const maxDecompressedSize = options.maxDecompressedSize ?? config.maxDecompressedSize;
+      if (isCompressed && originalSize > maxDecompressedSize) {
+        throw new Error(
+          `Payload is ${originalSize} bytes uncompressed, over maxDecompressedSize ${maxDecompressedSize}; ` +
+          'readers with the same limit would refuse it, so nothing was published. ' +
+          'Raise maxDecompressedSize on both publisher and fetcher, or publish uncompressed.',
+        );
+      }
+
       const finalSize = calculateSize(processedContent);
 
       // Check if chunking is needed (per-call threshold, then global default)
