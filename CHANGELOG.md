@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-10-08
+
+### Fixed
+- CommonJS `require('nostr-chunked-events')` failed with `ERR_REQUIRE_ESM` (#2).
+  Because the package is `"type": "module"`, Node loaded the CommonJS build
+  `dist/index.cjs.js` as ESM. The build is now `dist/index.cjs`, and `main`
+  and `exports.require` point at it.
+- Types resolve correctly for each condition. `import` uses `dist/index.d.ts`
+  and `require` uses the new `dist/index.d.cts`. Before, the top-level `types`
+  condition came after `import`/`require` and never took effect, so node16
+  CommonJS TypeScript consumers got TS1479.
+
+### Changed
+- The unreachable `browser` export condition is replaced by an explicit
+  `nostr-chunked-events/umd` subpath. The `browser` field and the unpkg URL
+  `dist/index.umd.js` are unchanged.
+
+### Added
+- `test/package.test.ts`: packs the tarball, installs it into a temporary
+  project and checks `require()`, ESM `import`, node16 types and the UMD global.
+
 ## [0.3.0] - 2026-10-08
 
 Reconciles this repository with the hardened copy that lived in
