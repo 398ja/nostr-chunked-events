@@ -25,7 +25,9 @@ export default [
   {
     input: 'src/index.ts',
     output: {
-      file: 'dist/index.cjs.js',
+      // `.cjs`, not `.js`: package.json has "type": "module", so Node would
+      // load a `.js` file as ESM and require() would fail (ERR_REQUIRE_ESM).
+      file: 'dist/index.cjs',
       format: 'cjs',
       sourcemap: true
     },
@@ -55,13 +57,13 @@ export default [
     ],
     external
   },
-  // Type declarations
+  // Type declarations: `.d.ts` for import, `.d.cts` for require
   {
     input: 'src/index.ts',
-    output: {
-      file: 'dist/index.d.ts',
-      format: 'es'
-    },
+    output: [
+      { file: 'dist/index.d.ts', format: 'es' },
+      { file: 'dist/index.d.cts', format: 'es' }
+    ],
     plugins: [dts()],
     external
   }

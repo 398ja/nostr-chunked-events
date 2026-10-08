@@ -3,17 +3,23 @@
   "version": "0.3.0",
   "description": "Chunked event publishing and fetching for Nostr - handle large content that exceeds relay size limits",
   "type": "module",
-  "main": "dist/index.cjs.js",
+  "main": "dist/index.cjs",
   "module": "dist/index.esm.js",
   "browser": "dist/index.umd.js",
   "types": "dist/index.d.ts",
   "exports": {
     ".": {
-      "import": "./dist/index.esm.js",
-      "require": "./dist/index.cjs.js",
-      "browser": "./dist/index.umd.js",
-      "types": "./dist/index.d.ts"
-    }
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.esm.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./umd": "./dist/index.umd.js",
+    "./package.json": "./package.json"
   },
   "files": [
     "dist",
