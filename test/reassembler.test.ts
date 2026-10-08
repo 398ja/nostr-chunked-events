@@ -1,10 +1,14 @@
+import { createHash } from 'node:crypto';
 import { describe, it, expect } from 'vitest';
 import {
   parseChunkFromEvent,
+  parseChunkEvent,
   isChunkEvent,
   hasMigrationMarker,
   sortChunks,
   validateChunks,
+  validateSnapshot,
+  selectBestSnapshot,
   reassembleChunks,
   getTotalChunks,
   getEventVersion,
@@ -14,16 +18,20 @@ import type { Event } from 'nostr-tools';
 import type { ChunkData } from '../src/types';
 
 // Helper to create mock events
-function createMockEvent(tags: string[][], content: string): Event {
+function createMockEvent(tags: string[][], content: string, overrides: Partial<Event> = {}): Event {
   return {
-    id: 'test-id',
-    pubkey: 'test-pubkey',
-    created_at: Math.floor(Date.now() / 1000),
-    kind: 30078,
-    tags,
-    content,
-    sig: 'test-sig',
+    id: overrides.id ?? 'test-id',
+    pubkey: overrides.pubkey ?? 'test-pubkey',
+    created_at: overrides.created_at ?? Math.floor(Date.now() / 1000),
+    kind: overrides.kind ?? 30078,
+    tags: overrides.tags ?? tags,
+    content: overrides.content ?? content,
+    sig: overrides.sig ?? 'test-sig',
   };
+}
+
+function sha256(content: string): string {
+  return createHash('sha256').update(content).digest('hex');
 }
 
 describe('reassembler', () => {
@@ -54,6 +62,35 @@ describe('reassembler', () => {
     it('should return null for invalid chunk tags', () => {
       const event = createMockEvent([['chunk', 'invalid']], 'data');
       expect(parseChunkFromEvent(event)).toBeNull();
+    });
+  });
+
+  describe('parseChunkEvent', () => {
+    it('should parse snapshot metadata from event tags', () => {
+      const event = createMockEvent(
+        [
+          ['d', 'wallet-chunk-0'],
+          ['chunk', '0', '2'],
+          ['snapshot_id', 'snapshot-a'],
+          ['payload_hash', 'hash-a'],
+          ['hash_alg', 'sha256'],
+          ['total_chunks', '2'],
+        ],
+        'chunk data',
+        {
+          id: 'event-a',
+          created_at: 123,
+        },
+      );
+
+      const result = parseChunkEvent(event);
+      expect(result).not.toBeNull();
+      expect(result?.snapshotId).toBe('snapshot-a');
+      expect(result?.payloadHash).toBe('hash-a');
+      expect(result?.hashAlg).toBe('sha256');
+      expect(result?.totalChunksTag).toBe(2);
+      expect(result?.eventId).toBe('event-a');
+      expect(result?.createdAt).toBe(123);
     });
   });
 
@@ -184,6 +221,190 @@ describe('reassembler', () => {
       ];
 
       expect(() => reassembleChunks(chunks)).toThrow('Duplicate chunks');
+    });
+  });
+
+  describe('validateSnapshot', () => {
+    it('should validate a strict snapshot and verify payload hash', async () => {
+      const payload = '{"tokens":[1,2]}';
+      const payloadHash = sha256(payload);
+      const chunks = [
+        parseChunkEvent(createMockEvent(
+          [
+            ['d', 'wallet-chunk-0'],
+            ['chunk', '0', '2'],
+            ['snapshot_id', 'snapshot-a'],
+            ['payload_hash', payloadHash],
+            ['hash_alg', 'sha256'],
+            ['total_chunks', '2'],
+          ],
+          payload.slice(0, 8),
+          { id: 'chunk-a0', created_at: 10 },
+        )),
+        parseChunkEvent(createMockEvent(
+          [
+            ['d', 'wallet-chunk-1'],
+            ['chunk', '1', '2'],
+            ['snapshot_id', 'snapshot-a'],
+            ['payload_hash', payloadHash],
+            ['hash_alg', 'sha256'],
+            ['total_chunks', '2'],
+          ],
+          payload.slice(8),
+          { id: 'chunk-a1', created_at: 10 },
+        )),
+      ].filter((chunk): chunk is NonNullable<typeof chunk> => chunk !== null);
+
+      const result = await validateSnapshot(chunks, {
+        expectedAuthor: 'test-pubkey',
+        verifyPayloadHash: true,
+      });
+
+      expect(result.valid).toBe(true);
+      expect(result.snapshotId).toBe('snapshot-a');
+      expect(result.totalChunks).toBe(2);
+      expect(result.payloadHashVerified).toBe(true);
+    });
+
+    it('should reject duplicate chunk indices within one snapshot', async () => {
+      const payload = 'abcdef';
+      const payloadHash = sha256(payload);
+      const chunks = [
+        parseChunkEvent(createMockEvent(
+          [
+            ['d', 'wallet-chunk-0'],
+            ['chunk', '0', '2'],
+            ['snapshot_id', 'snapshot-a'],
+            ['payload_hash', payloadHash],
+            ['hash_alg', 'sha256'],
+            ['total_chunks', '2'],
+          ],
+          'abc',
+          { id: 'chunk-a0-old', created_at: 10 },
+        )),
+        parseChunkEvent(createMockEvent(
+          [
+            ['d', 'wallet-chunk-0'],
+            ['chunk', '0', '2'],
+            ['snapshot_id', 'snapshot-a'],
+            ['payload_hash', payloadHash],
+            ['hash_alg', 'sha256'],
+            ['total_chunks', '2'],
+          ],
+          'abc',
+          { id: 'chunk-a0-new', created_at: 11 },
+        )),
+        parseChunkEvent(createMockEvent(
+          [
+            ['d', 'wallet-chunk-1'],
+            ['chunk', '1', '2'],
+            ['snapshot_id', 'snapshot-a'],
+            ['payload_hash', payloadHash],
+            ['hash_alg', 'sha256'],
+            ['total_chunks', '2'],
+          ],
+          'def',
+          { id: 'chunk-a1', created_at: 11 },
+        )),
+      ].filter((chunk): chunk is NonNullable<typeof chunk> => chunk !== null);
+
+      const result = await validateSnapshot(chunks, {
+        expectedAuthor: 'test-pubkey',
+        verifyPayloadHash: true,
+      });
+
+      expect(result.valid).toBe(false);
+      expect(result.issues.map((issue) => issue.code)).toContain('duplicate_index');
+    });
+
+    it('should reject wrong-author chunks', async () => {
+      const payload = 'abcdef';
+      const payloadHash = sha256(payload);
+      const chunks = [
+        parseChunkEvent(createMockEvent(
+          [
+            ['d', 'wallet-chunk-0'],
+            ['chunk', '0', '1'],
+            ['snapshot_id', 'snapshot-a'],
+            ['payload_hash', payloadHash],
+            ['hash_alg', 'sha256'],
+            ['total_chunks', '1'],
+          ],
+          payload,
+          {
+            id: 'chunk-a0',
+            pubkey: 'wrong-pubkey',
+            created_at: 10,
+          },
+        )),
+      ].filter((chunk): chunk is NonNullable<typeof chunk> => chunk !== null);
+
+      const result = await validateSnapshot(chunks, {
+        expectedAuthor: 'test-pubkey',
+        verifyPayloadHash: true,
+      });
+
+      expect(result.valid).toBe(false);
+      expect(result.issues.map((issue) => issue.code)).toContain('wrong_author');
+    });
+  });
+
+  describe('selectBestSnapshot', () => {
+    it('should select the newest valid snapshot instead of an incomplete newer snapshot', async () => {
+      const olderPayload = 'older-valid-payload';
+      const olderHash = sha256(olderPayload);
+      const newerPayload = 'newer-incomplete-payload';
+      const newerHash = sha256(newerPayload);
+      const events = [
+        createMockEvent(
+          [
+            ['d', 'wallet-chunk-0'],
+            ['chunk', '0', '3'],
+            ['snapshot_id', 'snapshot-new'],
+            ['payload_hash', newerHash],
+            ['hash_alg', 'sha256'],
+            ['total_chunks', '3'],
+          ],
+          newerPayload.slice(0, 8),
+          { id: 'new-0', created_at: 20 },
+        ),
+        createMockEvent(
+          [
+            ['d', 'wallet-chunk-0'],
+            ['chunk', '0', '2'],
+            ['snapshot_id', 'snapshot-old'],
+            ['payload_hash', olderHash],
+            ['hash_alg', 'sha256'],
+            ['total_chunks', '2'],
+          ],
+          olderPayload.slice(0, 8),
+          { id: 'old-0', created_at: 10 },
+        ),
+        createMockEvent(
+          [
+            ['d', 'wallet-chunk-1'],
+            ['chunk', '1', '2'],
+            ['snapshot_id', 'snapshot-old'],
+            ['payload_hash', olderHash],
+            ['hash_alg', 'sha256'],
+            ['total_chunks', '2'],
+          ],
+          olderPayload.slice(8),
+          { id: 'old-1', created_at: 10 },
+        ),
+      ];
+
+      const result = await selectBestSnapshot(events, {
+        strategy: 'newest-valid',
+        expectedAuthor: 'test-pubkey',
+        verifyPayloadHash: true,
+      });
+
+      expect(result.selected?.snapshotId).toBe('snapshot-old');
+      expect(result.validation?.valid).toBe(true);
+      expect(result.rejected).toHaveLength(1);
+      expect(result.rejected[0].candidate.snapshotId).toBe('snapshot-new');
+      expect(result.rejected[0].validation.issues.map((issue) => issue.code)).toContain('inconsistent_total');
     });
   });
 
