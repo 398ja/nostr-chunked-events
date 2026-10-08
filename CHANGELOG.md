@@ -70,6 +70,15 @@ not collide with the fork's different 0.2.0.
   nothing is published and `publish()` returns `success: false`.
   `serializedEventSize(event)` is exported.
 - `FetchResult.unreachable` and `RelaysUnreachableError`: see Changed.
+- `SourceUnreachableError` (a `queryEvents` source threw) is exported, so
+  `probe()` callers can `instanceof` it alongside `RelaysUnreachableError`.
+- `FetchResult.unverified` and `SignatureVerificationError`: when a
+  `queryEvents` source returned events for the author but every one failed
+  signature verification, `fetch` returns `{ success: false, unverified: true }`
+  and `probe()` rejects with `SignatureVerificationError`, instead of
+  "No data found" / `exists: false`. A single bad event among good ones is
+  still dropped silently.
+- `PublishOptions.maxDecompressedSize`: see Changed.
 - `LICENSE` file (MIT, as `package.json` already declared).
 
 ### Changed
@@ -108,6 +117,10 @@ not collide with the fork's different 0.2.0.
   `error: 'No data found'`.
 - The default fetcher sorts chunk-0 candidates (and each chunk query) newest
   first, so a stale relay listed first no longer wins.
+- With compression on, `publish()` refuses (nothing sent) a payload whose
+  uncompressed size exceeds `maxDecompressedSize` (per call or
+  `configure()`, default 8 MiB), since readers with the same limit refuse to
+  inflate it. The reader's cap is a bomb guard and does not follow the writer.
 - The README's strfry guidance is rewritten: the old "unencrypted 60,000"
   example overflowed strfry for quote-heavy JSON.
 - New runtime dependency `@noble/hashes` (pure-JS SHA-256), see above.
@@ -182,6 +195,13 @@ Relative to v0.1.0 (the API is a superset, but these behaviours changed):
 13. `RelayPool.query` throws `RelaysUnreachableError` when every relay is
     down, rather than returning `[]`.
 14. `npm run prepare` builds `dist/`, so a git install needs devDependencies.
+15. `ChunkedFetcher.probe()` rejects (with `RelaysUnreachableError`,
+    `SourceUnreachableError` or `SignatureVerificationError`) when the source
+    is unreachable or every returned event fails verification. v0.1.0
+    resolved `{ exists: false }`, which reads as "no data".
+16. With compression on, `publish()` refuses payloads above
+    `maxDecompressedSize` uncompressed (default 8 MiB) instead of writing
+    data the default reader cannot inflate.
 
 Relative to the imani-apps fork 0.2.0: `FetcherOptions.useApi` and the implicit
 `globalThis.nostrApi` lookup are gone (see above).

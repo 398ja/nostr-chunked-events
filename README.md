@@ -146,6 +146,14 @@ Make `queryEvents` **throw** when the backend is unreachable, not return `[]`. T
 
 `result.unreachable === true` means no relay could be reached (or `queryEvents` threw): the data may well exist. Never treat it as an empty account and publish fresh state over it. `error: 'No data found'` with `unreachable` unset means a source answered and had nothing.
 
+`result.unverified === true` means `queryEvents` returned events for the author but every one failed signature verification (typically a source that strips or re-serializes signatures). Treat it like `unreachable`, not as an empty account.
+
+`probe()` rejects instead of answering `exists: false` in the same cases: `RelaysUnreachableError`, `SourceUnreachableError` or `SignatureVerificationError`, all exported for `instanceof` checks.
+
+`selectBestSnapshot` / `validateSnapshot` / `groupChunksBySnapshot` filter by author but do not check signatures: verify events before passing them in, unless they came from a verifying pool such as nostr-tools' `SimplePool`.
+
+With `compression: true`, `publish()` refuses a payload whose uncompressed size is above `maxDecompressedSize` (default 8 MiB), because readers with the same limit would refuse it. Raise `maxDecompressedSize` on both sides to store more.
+
 ### With Encryption
 
 The library is encryption-agnostic. Encrypt before publishing, decrypt after fetching:
